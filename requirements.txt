@@ -1,0 +1,34 @@
+# Multi-Agent LightRAG API Requirements
+# Core API dependencies
+
+# FastAPI and server
+fastapi>=0.110.0,<1.0.0
+uvicorn[standard]>=0.27.0,<1.0.0
+python-multipart>=0.0.9,<1.0.0  # For file uploads
+
+# Async support
+aiofiles>=23.0.0,<25.0.0
+
+# Data validation
+pydantic>=2.0.0,<3.0.0
+
+# Redis for caching
+redis>=5.0.0,<8.0.0
+
+# OpenAI client (for vLLM compatibility)
+openai>=2.0.0,<3.0.0
+
+# LightRAG dependencies (from light_rag)
+ollama>=0.1.0,<1.0.0
+tiktoken>=0.8.0,<1.0.0
+networkx>=3.0.0,<4.0.0
+numpy>=1.24.0,<3.0.0
+tenacity>=8.0.0,<10.0.0
+python-dotenv>=1.0.0,<2.0.0
+
+# ColBERT for similarity (judge agent)
+transformers>=4.38.0,<5.0.0
+torch>=2.0.0
+
+# Logging
+colorama>=0.4.0,<1.0.0

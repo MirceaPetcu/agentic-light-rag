@@ -1,0 +1,18 @@
+# Multi-Agent LightRAG Framework
+
+Step 0: Save the orignal user query.
+Step 1: Decompose the user query 
+Step 2: Contextualize the  decomposed subqueries using LLM.
+Step 3: Retrieve initial knowledge graph context using the enriched queries
+
+Do while convergence or current_step < max_steps
+re-rank context with cross-encoder and then merge the tops with RRF ranker
+Step 4: LLM infers what answer could found from the retrieved context
+Step 5: LLM infers what was the original query that was addressed from the retrieved context.
+Step 6: Compute Cosine similarity between the original user query and the inferred query. If similarity > threshold, return convergence
+Step 7: If similarity <= threshold, identify missing context using LLM.
+Step 8: Given the retried context, the original query, the infered query and the infered answer generate subsequent subqueries from the missing context using LLM
+Step 9: Retrieve knowledge graph context again
+current_step += 1
+
+response_generation_agent(full_retrieved_context, original query)
