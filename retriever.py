@@ -4,17 +4,16 @@ Retriever Agent - Queries the LightRAG knowledge graph and applies Reciprocal Ra
 This agent is responsible for:
 - Receiving subqueries and retrieving context from the knowledge graph
 - Applying Reciprocal Rank Fusion (RRF) to merge results from multiple subqueries
-- Storing the final context in Redis
+- Storing the final context in memory
 - Returning the top-k fused results
 """
 
 import asyncio
-import json
 import hashlib
 from dataclasses import dataclass, field
 from typing import Any
 
-import redis.asyncio as redis
+import httpx
 
 from base_agent import BaseAgent
 from observation import Observation
@@ -101,76 +100,84 @@ class RetrieverResult:
 class RetrieverAgent(BaseAgent):
     """
     Agent responsible for retrieving context from LightRAG knowledge graph.
-    
+
     This agent:
     1. Receives subqueries and retrieves context for each
     2. Applies Reciprocal Rank Fusion (RRF) to merge results
     3. Returns top-k fused results
-    4. Stores final context in Redis
+    4. Stores final context in memory
     """
-    
+
     # RRF constant (commonly set to 60)
     RRF_K = 60
-    
+
     def __init__(
         self,
         name: str = "RetrieverAgent",
         lightrag: LightRAG | None = None,
-        redis_client: redis.Redis | None = None,
         top_k: int = 10,
         query_mode: str = "mix",
-        redis_key_prefix: str = "retriever:context:",
-        redis_ttl: int = 3600,  # 1 hour default TTL
+        colbert_base_url: str = "http://localhost:8002",
     ):
         """
         Initialize the RetrieverAgent.
-        
+
         Args:
             name: Agent name
             lightrag: LightRAG instance for querying the knowledge graph
-            redis_client: Redis client for storing/retrieving context
             top_k: Number of top results to return after RRF
             query_mode: LightRAG query mode ("local", "global", "hybrid", "mix", "naive")
-            redis_key_prefix: Prefix for Redis keys
-            redis_ttl: TTL for Redis keys in seconds
+            colbert_base_url: Base URL for the ColBERT service
         """
         super().__init__(name)
         self.lightrag = lightrag
-        self.redis_client = redis_client
         self.top_k = top_k
         self.query_mode = query_mode
-        self.redis_key_prefix = redis_key_prefix
-        self.redis_ttl = redis_ttl
+        self.colbert_base_url = colbert_base_url.rstrip("/")
+        self._http_client = None
+
+        # In-memory storage for retrieval results (keyed by query hash)
+        self._memory: dict[str, RetrieverResult] = {}
+
+    @property
+    def http_client(self) -> httpx.AsyncClient:
+        """Lazy initialize async HTTP client."""
+        if self._http_client is None:
+            self._http_client = httpx.AsyncClient(timeout=60.0)
+        return self._http_client
     
-    async def act(self, observation: Observation) -> RetrieverResult:
+    async def act(
+        self,
+        observation: Observation,
+        mode: str | None = 'mix',
+    ) -> RetrieverResult:
         """
         Execute the retrieval action based on the observation.
-        
+
         Args:
             observation: Contains the queries and step information
-            
+            mode: LightRAG query mode ("local", "global", "hybrid", "mix", "naive").
+                  If None, uses self.query_mode (default from constructor).
+
         Returns:
             RetrieverResult with fused contexts
         """
         subqueries = observation.subqueries
         original_query = observation.original_query
         step = observation.step
-        
+
         if step == 1:
             return await self._first_step_retrieval(
                 subqueries=subqueries,
                 original_query=original_query,
+                mode=mode,
             )
         else:
-            # TODO: Implement subsequent step retrieval
-            # This will involve:
-            # - Loading old context from Redis
-            # - Merging with new retrieved context
-            # - Re-ranking and fusing all contexts
             return await self._subsequent_step_retrieval(
                 subqueries=subqueries,
                 original_query=original_query,
                 step=step,
+                mode=mode,
             )
     
     async def think(self, data: Any) -> dict[str, Any]:
@@ -190,42 +197,44 @@ class RetrieverAgent(BaseAgent):
         self,
         subqueries: list[str],
         original_query: str,
+        mode: str | None = None,
     ) -> RetrieverResult:
         """
         Perform first step retrieval:
         1. Query LightRAG for each subquery
-        2. Apply RRF to fuse results
-        3. Store in Redis
-        4. Return top-k results
-        
+        2. Rerank each subquery's results using ColBERT similarity
+        3. Apply RRF to fuse the reranked results
+        4. Store in memory
+        5. Return top-k results
+
         Args:
             subqueries: List of decomposed subqueries
             original_query: The original user query
-            
+            mode: LightRAG query mode. If None, uses self.query_mode.
+
         Returns:
             RetrieverResult with fused contexts
         """
         if not self.lightrag:
             raise ValueError("LightRAG instance is required for retrieval")
-        
+
         # Retrieve contexts for all subqueries in parallel
         retrieval_tasks = [
-            self._retrieve_for_query(query) for query in subqueries
+            self._retrieve_for_query(query, mode=mode) for query in subqueries
         ]
         query_results = await asyncio.gather(*retrieval_tasks)
-        
-        # Build ranked lists for RRF
-        # Each query produces a ranked list of contexts
-        ranked_lists: list[list[RetrievedContext]] = []
+
+        # Build query-context pairs for reranking
+        query_context_pairs: list[tuple[str, list[RetrievedContext]]] = []
         for query, contexts in zip(subqueries, query_results):
-            # Assign ranks based on position
+            # Assign source query to each context
             for rank, ctx in enumerate(contexts):
                 ctx.original_rank = rank
                 ctx.source_query = query
-            ranked_lists.append(contexts)
-        
-        # Apply Reciprocal Rank Fusion
-        fused_contexts, rrf_scores = self._reciprocal_rank_fusion(ranked_lists)
+            query_context_pairs.append((query, contexts))
+
+        # Rerank with ColBERT, then apply RRF fusion
+        fused_contexts, rrf_scores = await self._rerank_and_fuse(query_context_pairs)
         
         # Take top-k results
         top_contexts = fused_contexts[:self.top_k]
@@ -243,7 +252,7 @@ class RetrieverAgent(BaseAgent):
         )
         
         # Store in Redis
-        await self._store_in_redis(original_query, result)
+        self._store_in_memory(original_query, result)
         
         return result
     
@@ -252,50 +261,129 @@ class RetrieverAgent(BaseAgent):
         subqueries: list[str],
         original_query: str,
         step: int,
+        mode: str | None = None,
     ) -> RetrieverResult:
         """
         Perform subsequent step retrieval (step > 1).
-        
-        TODO: NOT IMPLEMENTED YET
-        This will involve:
-        - Loading old context from Redis
-        - Retrieving new context for new subqueries
-        - Merging old and new contexts
-        - Re-ranking and fusing all contexts
-        - Storing updated context in Redis
-        
+
+        This method:
+        1. Loads previous context from memory
+        2. Retrieves new context for new subqueries
+        3. Merges old and new contexts
+        4. Reranks each subquery's contexts using ColBERT similarity
+        5. Applies RRF on the reranked combined set
+        6. Keeps only top-k results
+        7. Stores updated context in memory
+
         Args:
             subqueries: New subqueries for this step
             original_query: The original user query
             step: Current step number
-            
+            mode: LightRAG query mode. If None, uses self.query_mode.
+
         Returns:
             RetrieverResult with fused contexts
         """
-        # TODO: Implement this in the future
-        # For now, raise NotImplementedError
-        raise NotImplementedError(
-            f"Subsequent step retrieval (step={step}) is not implemented yet. "
-            "This will be implemented to handle loading old context from Redis, "
-            "merging with new context, and re-ranking."
+        if not self.lightrag:
+            raise ValueError("LightRAG instance is required for retrieval")
+
+        # Step 1: Load previous context from memory
+        previous_result = self._load_from_memory(original_query)
+
+        # Step 2: Retrieve new contexts for all new subqueries in parallel
+        retrieval_tasks = [
+            self._retrieve_for_query(query, mode=mode) for query in subqueries
+        ]
+        query_results = await asyncio.gather(*retrieval_tasks)
+
+        # Step 3: Build query-context pairs for reranking
+        query_context_pairs: list[tuple[str, list[RetrievedContext]]] = []
+        all_subqueries = list(subqueries)  # Track all subqueries used
+
+        for query, contexts in zip(subqueries, query_results):
+            # Assign source query to each context
+            for rank, ctx in enumerate(contexts):
+                ctx.original_rank = rank
+                ctx.source_query = query
+            query_context_pairs.append((query, contexts))
+
+        # Step 4: Include previous contexts as additional query-context pairs
+        # This allows RRF to accumulate scores for contexts appearing across steps
+        if previous_result and previous_result.contexts:
+            # Group previous contexts by their source query to preserve ranking structure
+            previous_by_query: dict[str, list[RetrievedContext]] = {}
+            for ctx in previous_result.contexts:
+                source = ctx.source_query or "previous_step"
+                if source not in previous_by_query:
+                    previous_by_query[source] = []
+                previous_by_query[source].append(ctx)
+
+            # Add each group as a separate query-context pair for reranking
+            for source_query, contexts in previous_by_query.items():
+                # Sort by original rank to preserve ordering
+                contexts.sort(key=lambda x: x.original_rank)
+                query_context_pairs.append((source_query, contexts))
+
+            # Merge previous subqueries
+            all_subqueries.extend(previous_result.subqueries)
+
+        # Step 5: Rerank with ColBERT, then apply RRF fusion
+        fused_contexts, rrf_scores = await self._rerank_and_fuse(query_context_pairs)
+
+        # Step 6: Take top-k results
+        top_contexts = fused_contexts[:self.top_k]
+        top_scores = {
+            ctx.get_unique_id(): rrf_scores[ctx.get_unique_id()]
+            for ctx in top_contexts
+        }
+
+        # Step 7: Create result with accumulated subqueries
+        # Remove duplicate subqueries while preserving order
+        seen_queries = set()
+        unique_subqueries = []
+        for q in all_subqueries:
+            if q not in seen_queries:
+                seen_queries.add(q)
+                unique_subqueries.append(q)
+
+        result = RetrieverResult(
+            contexts=top_contexts,
+            rrf_scores=top_scores,
+            original_query=original_query,
+            subqueries=unique_subqueries,
+            step=step,
         )
+
+        # Step 8: Store updated result in Redis
+        self._store_in_memory(original_query, result)
+
+        return result
     
-    async def _retrieve_for_query(self, query: str) -> list[RetrievedContext]:
+    async def _retrieve_for_query(
+        self,
+        query: str,
+        mode: str | None = None,
+    ) -> list[RetrievedContext]:
         """
         Retrieve context from LightRAG for a single query.
-        
+
         Args:
             query: The query string
-            
+            mode: LightRAG query mode ("local", "global", "hybrid", "mix", "naive").
+                  If None, uses self.query_mode (default from constructor).
+
         Returns:
             List of RetrievedContext items
         """
         if not self.lightrag:
             return []
-        
+
+        # Use provided mode or fall back to instance default
+        effective_mode = mode if mode is not None else self.query_mode
+
         # Create query parameters - only get context, no LLM generation
         param = QueryParam(
-            mode=self.query_mode,
+            mode=effective_mode,
             only_need_context=True,
             only_need_prompt=False,
             top_k=self.top_k * 2,  # Retrieve more to have enough after fusion
@@ -386,90 +474,140 @@ class RetrieverAgent(BaseAgent):
                 contexts.append(ctx)
         
         return contexts
-    
-    def _reciprocal_rank_fusion(
+
+    async def _compute_colbert_similarity(self, query: str, document: str) -> float:
+        """
+        Compute ColBERT MaxSim similarity between query and document via the ColBERT service.
+
+        Args:
+            query: The query text
+            document: The document text
+
+        Returns:
+            Similarity score between 0 and 1
+        """
+        response = await self.http_client.post(
+            f"{self.colbert_base_url}/v1/similarity",
+            json={"query": query, "document": document}
+        )
+        response.raise_for_status()
+        result = response.json()
+        return result["similarity"]
+
+    async def _rerank_with_colbert(
         self,
-        ranked_lists: list[list[RetrievedContext]],
+        query: str,
+        contexts: list[RetrievedContext],
+    ) -> list[RetrievedContext]:
+        """
+        Rerank contexts using ColBERT similarity scores.
+
+        Args:
+            query: The sub-query to compute similarity against
+            contexts: List of contexts to rerank
+
+        Returns:
+            Contexts sorted by ColBERT similarity (descending)
+        """
+        if not contexts:
+            return []
+
+        # Compute similarity scores in parallel
+        similarity_tasks = [
+            self._compute_colbert_similarity(query, ctx.content)
+            for ctx in contexts
+        ]
+        scores = await asyncio.gather(*similarity_tasks)
+
+        # Pair contexts with scores
+        scored_contexts = list(zip(contexts, scores))
+
+        # Sort by score descending
+        scored_contexts.sort(key=lambda x: x[1], reverse=True)
+
+        # Return reranked contexts
+        return [ctx for ctx, _ in scored_contexts]
+
+    async def _rerank_and_fuse(
+        self,
+        query_context_pairs: list[tuple[str, list[RetrievedContext]]],
     ) -> tuple[list[RetrievedContext], dict[str, float]]:
         """
-        Apply Reciprocal Rank Fusion to merge multiple ranked lists.
-        
-        RRF Score = sum(1 / (k + rank_i)) for each list where item appears
-        
+        Rerank each sub-query's contexts with ColBERT, then apply RRF fusion.
+
+        This method:
+        1. For each (sub-query, contexts) pair, rerank contexts using ColBERT similarity
+        2. Apply Reciprocal Rank Fusion on the reranked lists
+
         Args:
-            ranked_lists: List of ranked context lists from different queries
-            
+            query_context_pairs: List of (sub-query, contexts) tuples
+
         Returns:
             Tuple of (fused sorted list, dict of context_id -> RRF score)
         """
+        # Phase 1: Rerank each sub-query's contexts using ColBERT
+        rerank_tasks = [
+            self._rerank_with_colbert(query, contexts)
+            for query, contexts in query_context_pairs
+        ]
+        reranked_lists = await asyncio.gather(*rerank_tasks)
+
+        # Phase 2: Apply RRF on the reranked lists
         rrf_scores: dict[str, float] = {}
         context_map: dict[str, RetrievedContext] = {}
-        
-        for ranked_list in ranked_lists:
+
+        for ranked_list in reranked_lists:
             for rank, ctx in enumerate(ranked_list):
                 ctx_id = ctx.get_unique_id()
-                
+
                 # Calculate RRF contribution from this list
                 rrf_contribution = 1.0 / (self.RRF_K + rank + 1)  # +1 because rank is 0-indexed
-                
+
                 if ctx_id in rrf_scores:
                     rrf_scores[ctx_id] += rrf_contribution
                 else:
                     rrf_scores[ctx_id] = rrf_contribution
                     context_map[ctx_id] = ctx
-        
+
         # Sort by RRF score (descending)
         sorted_ids = sorted(rrf_scores.keys(), key=lambda x: rrf_scores[x], reverse=True)
-        
+
         # Build sorted context list
         fused_contexts = [context_map[ctx_id] for ctx_id in sorted_ids]
-        
+
         return fused_contexts, rrf_scores
     
-    async def _store_in_redis(
+    def _store_in_memory(
         self,
         original_query: str,
         result: RetrieverResult,
     ) -> None:
         """
-        Store the retrieval result in Redis.
-        
+        Store the retrieval result in memory.
+
         Args:
             original_query: The original user query (used for key generation)
             result: The RetrieverResult to store
         """
-        if not self.redis_client:
-            return
-        
-        # Generate a key based on the original query
         query_hash = hashlib.md5(original_query.encode()).hexdigest()
-        key = f"{self.redis_key_prefix}{query_hash}"
-        
-        # Serialize and store
-        data = json.dumps(result.to_dict())
-        await self.redis_client.setex(key, self.redis_ttl, data)
-    
-    async def _load_from_redis(self, original_query: str) -> RetrieverResult | None:
+        self._memory[query_hash] = result
+
+    def _load_from_memory(self, original_query: str) -> RetrieverResult | None:
         """
-        Load previous retrieval result from Redis.
-        
+        Load previous retrieval result from memory.
+
         Args:
             original_query: The original user query
-            
+
         Returns:
             RetrieverResult if found, None otherwise
         """
-        if not self.redis_client:
-            return None
-        
         query_hash = hashlib.md5(original_query.encode()).hexdigest()
-        key = f"{self.redis_key_prefix}{query_hash}"
-        
-        data = await self.redis_client.get(key)
-        if data:
-            return RetrieverResult.from_dict(json.loads(data))
-        
-        return None
+        return self._memory.get(query_hash)
+
+    def clear_memory(self) -> None:
+        """Clear all stored retrieval results from memory."""
+        self._memory.clear()
     
     def get_context_as_string(self, result: RetrieverResult) -> str:
         """
@@ -514,5 +652,48 @@ class RetrieverAgent(BaseAgent):
                     chunk_str += f"\n   Source: {c.file_path}"
                 chunk_strs.append(chunk_str)
             sections.append("**Document Chunks:**\n" + "\n\n".join(chunk_strs))
-        
+
         return "\n\n".join(sections)
+
+    async def get_global_context(self, query: str) -> str:
+        """
+        Retrieve global context for the original query before query rewriting.
+
+        This method queries LightRAG in 'global' mode to get high-level knowledge
+        that can inform the query rewriter agent about the domain and available
+        information in the knowledge graph.
+
+        Args:
+            query: The original user query
+
+        Returns:
+            Formatted string with global context for the query rewriter
+        """
+        contexts = await self._retrieve_for_query(query, mode="global")
+
+        if not contexts:
+            return "No global context found."
+
+        # Format the global context for the query rewriter
+        sections = []
+
+        # Group by context type
+        entities = [c for c in contexts if c.context_type == "entity"]
+        relationships = [c for c in contexts if c.context_type == "relationship"]
+
+        if entities:
+            entity_strs = []
+            for e in entities:
+                entity_str = f"- {e.entity_name}"
+                if e.entity_type:
+                    entity_str += f" ({e.entity_type})"
+                if e.description:
+                    entity_str += f": {e.description}"
+                entity_strs.append(entity_str)
+            sections.append("**Key Entities:**\n" + "\n".join(entity_strs))
+
+        if relationships:
+            rel_strs = [f"- {r.content}" for r in relationships]
+            sections.append("**Key Relationships:**\n" + "\n".join(rel_strs))
+
+        return "\n\n".join(sections) if sections else "No global context found."

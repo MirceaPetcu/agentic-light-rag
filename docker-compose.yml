@@ -15,8 +15,8 @@ services:
     restart: unless-stopped
 
   # vllm:
-  #   image: vllm/vllm-openai:v0.6.6
-  #   container_name: vllm-server-llama3-8b
+  #   image: vllm/vllm-openai:latest
+  #   container_name: vllm-server-openai-gpt-oss-20b
   #   ports:
   #     - "8000:8000"
   #   environment:
@@ -32,7 +32,7 @@ services:
   #             count: all
   #             capabilities: [gpu]
   #   command: 
-  #     --model meta-llama/Meta-Llama-3-8B-Instruct
+  #     --model openai/gpt-oss-20b
   #     --host 0.0.0.0
   #     --port 8000
   #     --max-model-len 8192
@@ -48,7 +48,7 @@ services:
   #     start_period: 60s
       
   vllm-gemma:
-    image: vllm/vllm-openai:v0.6.6
+    image: vllm/vllm-openai:latest
     container_name: vllm-server-gemma-2-2b-it
     ports:
       - "8001:8000"
@@ -65,11 +65,10 @@ services:
               count: all
               capabilities: [gpu]
     command: 
-      --model Qwen/Qwen2-7B-Instruct-AWQ
-      --quantization awq
+      --model LiquidAI/LFM2-2.6B
       --host 0.0.0.0
       --port 8000
-      --max-model-len 8192
+      --max-model-len 32768
     volumes:
       # Cache HuggingFace models locally
       - ./model_cache:/root/.cache/huggingface
@@ -80,6 +79,7 @@ services:
       timeout: 10s
       retries: 3
       start_period: 60s
+
 
 volumes:
   neo4j_data:

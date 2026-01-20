@@ -1,6 +1,7 @@
 import json
 from typing import List, Optional
 
+import httpx
 from pydantic import BaseModel, Field
 from openai import AsyncOpenAI
 
@@ -42,14 +43,15 @@ class SubQuery(BaseModel):
 
 class GeneratedSubQueries(BaseModel):
     """Schema for generated sub-queries from missing context."""
-    subqueries: List[SubQuery] = Field(
-        ..., 
-        description="List of generated sub-queries to fill context gaps"
-    )
     reasoning: str = Field(
         ..., 
         description="Overall reasoning for the generated sub-queries"
     )
+    subqueries: List[SubQuery] = Field(
+        ..., 
+        description="List of generated sub-queries to fill context gaps"
+    )
+    
 
 
 class JudgementResult(BaseModel):
@@ -69,7 +71,7 @@ class JudgementResult(BaseModel):
 
 class JudgeAgent(BaseAgent):
     """Agent that judges whether retrieval has converged and generates new sub-queries if needed.
-    
+
     This agent performs:
     - Step 6: Compute similarity between original and inferred query using ColBERT
     - Step 7: If similarity <= threshold, identify missing context using LLM
@@ -82,9 +84,8 @@ class JudgeAgent(BaseAgent):
         base_url: str = "http://localhost:8001/v1",
         api_key: str = "EMPTY",
         model: str = "meta-llama/Llama-2-7b-chat-hf",
-        colbert_model: str = "colbert-ir/colbertv2.0",
+        colbert_base_url: str = "http://localhost:8002",
         similarity_threshold: float = 0.75,
-        device: str = "cuda"
     ):
         super().__init__(name)
         self.client = AsyncOpenAI(
@@ -92,29 +93,19 @@ class JudgeAgent(BaseAgent):
             api_key=api_key
         )
         self.model = model
-        self.colbert_model_name = colbert_model
+        self.colbert_base_url = colbert_base_url.rstrip("/")
         self.similarity_threshold = similarity_threshold
-        self.device = device
-        self._colbert_model = None
-        self._colbert_tokenizer = None
+        self._http_client = None
 
-    def _load_colbert(self):
-        """Lazy load ColBERT model and tokenizer."""
-        if self._colbert_model is None:
-            from transformers import AutoModel, AutoTokenizer
-            import torch
+    @property
+    def http_client(self) -> httpx.AsyncClient:
+        """Lazy initialize async HTTP client."""
+        if self._http_client is None:
+            self._http_client = httpx.AsyncClient(timeout=60.0)
+        return self._http_client
 
-            self._colbert_tokenizer = AutoTokenizer.from_pretrained(self.colbert_model_name)
-            self._colbert_model = AutoModel.from_pretrained(self.colbert_model_name)
-            self._colbert_model.to(self.device)
-            self._colbert_model.eval()
-
-    def _compute_colbert_similarity(self, query1: str, query2: str) -> float:
-        """Compute ColBERT MaxSim similarity between two queries.
-        
-        ColBERT uses late interaction where each token embedding from query1
-        is matched against all token embeddings from query2, taking the maximum
-        similarity for each query1 token, then averaging.
+    async def _compute_colbert_similarity(self, query1: str, query2: str) -> float:
+        """Compute ColBERT MaxSim similarity between two queries via the ColBERT service.
 
         Args:
             query1: The original user query.
@@ -123,58 +114,13 @@ class JudgeAgent(BaseAgent):
         Returns:
             float: Similarity score between 0 and 1.
         """
-        import torch
-        import torch.nn.functional as F
-
-        self._load_colbert()
-
-        # Tokenize both queries
-        tokens1 = self._colbert_tokenizer(
-            query1, 
-            return_tensors="pt", 
-            padding=True, 
-            truncation=True, 
-            max_length=512
-        ).to(self.device)
-        
-        tokens2 = self._colbert_tokenizer(
-            query2, 
-            return_tensors="pt", 
-            padding=True, 
-            truncation=True, 
-            max_length=512
-        ).to(self.device)
-
-        with torch.no_grad():
-            # Get token embeddings (not [CLS] pooling)
-            embeddings1 = self._colbert_model(**tokens1).last_hidden_state  # [1, seq_len1, hidden_dim]
-            embeddings2 = self._colbert_model(**tokens2).last_hidden_state  # [1, seq_len2, hidden_dim]
-
-            # Normalize embeddings
-            embeddings1 = F.normalize(embeddings1, p=2, dim=-1)
-            embeddings2 = F.normalize(embeddings2, p=2, dim=-1)
-
-            # Compute MaxSim: for each token in query1, find max similarity with any token in query2
-            # Similarity matrix: [1, seq_len1, seq_len2]
-            similarity_matrix = torch.matmul(embeddings1, embeddings2.transpose(-1, -2))
-
-            # Get attention mask to ignore padding tokens
-            mask1 = tokens1["attention_mask"].unsqueeze(-1).float()  # [1, seq_len1, 1]
-            mask2 = tokens2["attention_mask"].unsqueeze(1).float()   # [1, 1, seq_len2]
-
-            # Apply mask: set padding positions to very negative value
-            masked_similarity = similarity_matrix * mask2 + (1 - mask2) * (-1e9)
-
-            # MaxSim: max over query2 tokens for each query1 token
-            max_sim_per_token = masked_similarity.max(dim=-1).values  # [1, seq_len1]
-
-            # Apply mask for query1 and compute mean over valid tokens
-            max_sim_per_token = max_sim_per_token * mask1.squeeze(-1)
-            num_valid_tokens = mask1.squeeze(-1).sum()
-            
-            similarity_score = max_sim_per_token.sum() / num_valid_tokens
-
-        return float(similarity_score.cpu())
+        response = await self.http_client.post(
+            f"{self.colbert_base_url}/v1/similarity",
+            json={"query": query1, "document": query2}
+        )
+        response.raise_for_status()
+        result = response.json()
+        return result["similarity"]
 
     async def _identify_missing_context(
         self, 
@@ -198,7 +144,7 @@ class JudgeAgent(BaseAgent):
 
 Inferred Query (what the context actually addresses): {inferred_query}
 
-Inferred Answer: {inferred_answer}
+Inferred Answer (what the context actually answers): {inferred_answer}
 
 Retrieved Context:
 {context}"""
@@ -243,7 +189,7 @@ Retrieved Context:
 
 Inferred Query (what the context actually addresses): {inferred_query}
 
-Inferred Answer: {inferred_answer}
+Inferred Answer (what the context actually answers): {inferred_answer}
 
 Retrieved Context:
 {context}
@@ -292,7 +238,7 @@ Missing Information Analysis:
         threshold = threshold or self.similarity_threshold
 
         # Step 6: Compute ColBERT similarity
-        similarity_score = self._compute_colbert_similarity(original_query, inferred_query)
+        similarity_score = await self._compute_colbert_similarity(original_query, inferred_query)
 
         # Check convergence
         if similarity_score > threshold:

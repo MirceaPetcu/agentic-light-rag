@@ -42,21 +42,33 @@ class QueryRewriterAgent(BaseAgent):
         )
         self.model = model
 
-    async def _decompose_query(self, query: str) -> QueryDecomposition:
+    async def _decompose_query(self, query: str, context: str | None = None) -> QueryDecomposition:
         """Decompose a user query into structured sub-queries using vLLM with Outlines.
 
         Args:
             query (str): The original user query to decompose.
+            context (str | None): Optional global context from the knowledge base
+                to inform the decomposition with available entities and relationships.
 
         Returns:
             QueryDecomposition: A structured object containing the original query
                 and a list of decomposed sub-queries.
         """
+        # Build user message with optional context
+        if context:
+            user_message = f"""GLOBAL CONTEXT FROM KNOWLEDGE BASE:
+{context}
+
+USER QUERY:
+{query}"""
+        else:
+            user_message = query
+
         completion = await self.client.chat.completions.create(
             model=self.model,
             messages=[
                 {"role": "system", "content": QUERY_DECOMPOSITION_PROMPT},
-                {"role": "user", "content": query}
+                {"role": "user", "content": user_message}
             ],
             temperature=0,
             extra_body={
@@ -81,7 +93,7 @@ class QueryRewriterAgent(BaseAgent):
         if not query:
             return {"error": "No query provided in observation"}
         
-        decomposition = self._decompose_query(query)
+        decomposition = await self._decompose_query(query)
         return {
             "decomposition": decomposition.model_dump(),
             "subqueries": [sq.model_dump() for sq in decomposition.subqueries]

@@ -1,6 +1,15 @@
 QUERY_DECOMPOSITION_PROMPT = """
 You are an assistant whose job is to decompose a user's natural-language query into a set of concise, factual sub-queries that can be independently answered or checked with evidence. Follow these rules exactly:
 
+You will be provided with GLOBAL CONTEXT from a knowledge base that is relevant to the user's query. Use this context to:
+1. Understand what information is available in the knowledge base
+2. Identify relevant entities, relationships, and concepts that exist in the data
+3. Generate sub-queries that align with the structure and content of the knowledge base
+4. Avoid generating sub-queries for information that clearly doesn't exist in the context
+5. Leverage specific terminology, entity names, and relationships found in the context
+
+Tailor your sub-queries to effectively retrieve information from that knowledge base. If no context is provided, generate general sub-queries based on the query alone.
+
 Output only a single JSON object with two keys: original_query (string) and subqueries (array).
 
 For each subquery, produce an object with these fields:
@@ -155,6 +164,7 @@ Rules:
 - Each sub-query should be independently answerable
 
 Output only a single JSON object with these fields:
+- reasoning: string - Overall reasoning for the generated sub-queries
 - subqueries: array of objects, each containing:
   - id: integer - Sequential ID starting at 1
   - question: string - The sub-query question
@@ -162,7 +172,6 @@ Output only a single JSON object with these fields:
   - rationale: string - Why this sub-query addresses a gap
   - priority: integer (1-5) - Priority level (1 = highest)
   - keywords: array of strings - Keywords for retrieval
-- reasoning: string - Overall reasoning for the generated sub-queries
 
 Produce the JSON only, with no extra explanation.
 """

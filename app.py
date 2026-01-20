@@ -37,7 +37,7 @@ WORKING_DIR = os.getenv("LIGHTRAG_WORKING_DIR", "./rag_storage")
 REDIS_URL = os.getenv("REDIS_URL", "redis://localhost:6379")
 VLLM_BASE_URL = os.getenv("VLLM_BASE_URL", "http://localhost:8001/v1")
 VLLM_API_KEY = os.getenv("VLLM_API_KEY", "EMPTY")
-VLLM_MODEL = os.getenv("VLLM_MODEL", "Qwen/Qwen2-7B-Instruct-AWQ")
+VLLM_MODEL = os.getenv("VLLM_MODEL", "LiquidAI/LFM2-2.6B")
 
 # LightRAG Storage Configuration
 LIGHTRAG_GRAPH_STORAGE = os.getenv("LIGHTRAG_GRAPH_STORAGE", "NetworkXStorage")
@@ -164,6 +164,7 @@ async def lifespan(app: FastAPI):
             ),
         ),
         graph_storage=LIGHTRAG_GRAPH_STORAGE,
+        use_guided_json_extraction=True
     )
     
     await rag.initialize_storages()
@@ -224,7 +225,6 @@ def create_agents(
         "retriever": RetrieverAgent(
             name="retriever",
             lightrag=rag,
-            redis_client=redis_client,
             top_k=top_k,
             query_mode="mix",
         ),
@@ -289,9 +289,19 @@ async def run_multi_agent_pipeline(
     
     # Step 0: Save original query
     original_query = query
-    
+    # gather some global context of the knowledge base related to the user query
+    # for more informed decomposition and retrieval
+    global_context_result = await retriever.act(Observation(
+        original_query=original_query,
+        subqueries=[original_query],
+        step=0,
+        max_steps=max_steps,
+        similarity_threshold=similarity_threshold,
+    ), mode='global')
+    global_context = retriever.get_context_as_string(global_context_result)
+
     # Step 1 & 2: Decompose and contextualize the query
-    decomposition = await query_rewriter._decompose_query(original_query)
+    decomposition = await query_rewriter._decompose_query(original_query, context=global_context)
     subqueries = [sq.canonical_form for sq in decomposition.subqueries]
     
     if not subqueries:
@@ -319,7 +329,9 @@ async def run_multi_agent_pipeline(
     # Main loop
     current_step = 1
     converged = False
-    
+    inferred_answer = {}
+    inferred_query = {}
+
     while current_step < max_steps and not converged:
         # Step 4 & 5: Deduce answer and query from context
         deduction_result = await deducer.deduce(context_string)
