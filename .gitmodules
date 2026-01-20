@@ -1,4 +1,4 @@
 [submodule "light_rag"]
 	path = light_rag
-	url = https://github.com/HKUDS/LightRAG.git
+	url = git@github.com:MirceaPetcu/LightRAG.git
 	branch = main
