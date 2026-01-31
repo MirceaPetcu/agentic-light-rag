@@ -60,16 +60,32 @@ services:
     image: ollama/ollama:latest
     container_name: ollama-lightrag
     ports:
-      - "11434:11434"
+      - "11435:11434"
     volumes:
       - ollama_data:/root/.ollama
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - |
+        ollama serve &
+        pid=$$!
+        sleep 10
+        ollama pull ${EMBEDDING_MODEL:-qwen3-embedding:0.6b}
+        wait $$pid
+    environment:
+      - EMBEDDING_MODEL=${EMBEDDING_MODEL:-qwen3-embedding:0.6b}
+      - NVIDIA_VISIBLE_DEVICES=""
+      - CUDA_VISIBLE_DEVICES=""
+    deploy:
+      resources:
+        reservations:
+          devices: []
     restart: unless-stopped
     healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:11434/api/tags"]
+      test: ["CMD", "ollama", "list"]
       interval: 30s
       timeout: 10s
       retries: 3
-      start_period: 30s
+      start_period: 60s
 
   # =============================================================================
   # ColBERT Embeddings Service
@@ -94,51 +110,6 @@ services:
       retries: 3
       start_period: 60s
 
-  # =============================================================================
-  # LightRAG FastAPI Server
-  # =============================================================================
-  lightrag-fastapi:
-    build:
-      context: .
-      dockerfile: Dockerfile.lightrag_fastapi
-    container_name: lightrag-fastapi-server
-    ports:
-      - "8000:8000"
-    environment:
-      # LightRAG Configuration
-      - LIGHTRAG_WORKING_DIR=/app/rag_storage
-      - WORKSPACE=${WORKSPACE:-default}
-      # Storage Configuration
-      - KV_STORAGE=${KV_STORAGE:-JsonKVStorage}
-      - VECTOR_STORAGE=${VECTOR_STORAGE:-NanoVectorDBStorage}
-      - GRAPH_STORAGE=${GRAPH_STORAGE:-NetworkXStorage}
-      - DOC_STATUS_STORAGE=${DOC_STATUS_STORAGE:-JsonDocStatusStorage}
-      # LLM Configuration
-      - LLM_BINDING_HOST=${LLM_BINDING_HOST:-http://vllm:8000/v1}
-      - LLM_BINDING_API_KEY=${LLM_BINDING_API_KEY:-EMPTY}
-      - LLM_MODEL=${LLM_MODEL:-LiquidAI/LFM2-2.6B}
-      # Embedding Configuration (Ollama)
-      - EMBEDDING_MODEL=${EMBEDDING_MODEL:-bge-m3:latest}
-      - EMBEDDING_BINDING_HOST=${EMBEDDING_BINDING_HOST:-http://ollama:11434}
-      - EMBEDDING_DIM=${EMBEDDING_DIM:-1024}
-      - MAX_EMBED_TOKENS=${MAX_EMBED_TOKENS:-32768}
-      # Server Configuration
-      - HOST=0.0.0.0
-      - PORT=8000
-    volumes:
-      - ./rag_storage:/app/rag_storage
-    depends_on:
-      ollama:
-        condition: service_healthy
-      vllm:
-        condition: service_healthy
-    restart: unless-stopped
-    healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
-      interval: 30s
-      timeout: 10s
-      retries: 3
-      start_period: 30s
 
   # =============================================================================
   # Main Application (Multi-Agent LightRAG API)

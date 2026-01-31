@@ -30,6 +30,10 @@ from lightrag.utils import (
     sanitize_text_for_encoding,
     compute_mdhash_id,
 )
+from lightrag import LightRAG, QueryParam
+from lightrag.llm.openai import openai_complete_if_cache
+from lightrag.utils import EmbeddingFunc
+from functools import partial
 
 # ============================================================================
 # Configuration from environment
@@ -37,6 +41,9 @@ from lightrag.utils import (
 
 WORKING_DIR = os.getenv("LIGHTRAG_WORKING_DIR", "./rag_storage")
 WORKSPACE = os.getenv("WORKSPACE", "")
+
+# LightRAG Storage Configuration
+LIGHTRAG_GRAPH_STORAGE = os.getenv("LIGHTRAG_GRAPH_STORAGE", "NetworkXStorage")
 
 # LLM Configuration
 LLM_BINDING_HOST = os.getenv("LLM_BINDING_HOST", "https://api.deepseek.com")
@@ -70,7 +77,7 @@ async def llm_model_func(
     keyword_extraction: bool = False,
     **kwargs
 ) -> str:
-    """LLM function for LightRAG using OpenAI-compatible API."""
+    """LLM function for LightRAG using vLLM (OpenAI-compatible API)."""
     return await openai_complete_if_cache(
         model=LLM_MODEL,
         prompt=prompt,
@@ -83,16 +90,17 @@ async def llm_model_func(
         **kwargs,
     )
 
-
 def create_embedding_func() -> EmbeddingFunc:
     """Create embedding function using Ollama."""
     return EmbeddingFunc(
-        func=ollama_embed,
-        model_name=EMBEDDING_MODEL,
-        embedding_dim=EMBEDDING_DIM,
-        max_token_size=MAX_EMBED_TOKENS,
-        base_url=EMBEDDING_HOST,
-    )
+            embedding_dim=EMBEDDING_DIM,
+            max_token_size=MAX_EMBED_TOKENS,
+            func=partial(
+                ollama_embed,
+                embed_model=EMBEDDING_MODEL,
+                host=EMBEDDING_HOST,
+            ),
+        ),
 
 
 # ============================================================================
@@ -346,38 +354,41 @@ async def lifespan(app: FastAPI):
     global rag
     
     # Initialize LightRAG
-    logger.info("Initializing LightRAG instance...")
-    try:
-        rag = LightRAG(
-            working_dir=WORKING_DIR,
-            workspace=WORKSPACE,
-            llm_model_func=llm_model_func,
-            llm_model_name=LLM_MODEL,
-            embedding_func=create_embedding_func(),
-            kv_storage=KV_STORAGE,
-            vector_storage=VECTOR_STORAGE,
-            graph_storage=GRAPH_STORAGE,
-            doc_status_storage=DOC_STATUS_STORAGE,
-        )
-        
-        # Initialize storages
-        await rag.initialize_storages()
-        logger.info("LightRAG instance initialized successfully")
-        
-    except Exception as e:
-        logger.error(f"Failed to initialize LightRAG: {e}", exc_info=True)
-        raise
+    print("Initializing LightRAG...")
+
+    # Ensure working directory exists
+    os.makedirs(WORKING_DIR, exist_ok=True)
+
+    # Initialize LightRAG
+    # Neo4j configuration is automatically read from environment variables:
+    # NEO4J_URI, NEO4J_USERNAME, NEO4J_PASSWORD
+    rag = LightRAG(
+        working_dir=WORKING_DIR,
+        llm_model_func=llm_model_func,
+        embedding_func=EmbeddingFunc(
+            embedding_dim=EMBEDDING_DIM,
+            max_token_size=MAX_EMBED_TOKENS,
+            func=partial(
+                ollama_embed,
+                embed_model=EMBEDDING_MODEL,
+                host=EMBEDDING_HOST,
+            ),
+        ),
+        graph_storage=LIGHTRAG_GRAPH_STORAGE,
+        use_guided_json_extraction=True
+    )
+
+    await rag.initialize_storages()
+    print(f"LightRAG initialized with working directory: {WORKING_DIR}")
+    print(f"Graph storage backend: {LIGHTRAG_GRAPH_STORAGE}")
     
     yield
-    
-    # Cleanup
-    logger.info("Shutting down LightRAG instance...")
+
+    # Shutdown
+    print("Shutting down...")
     if rag:
-        try:
-            await rag.finalize_storages()
-            logger.info("LightRAG instance finalized successfully")
-        except Exception as e:
-            logger.error(f"Error during LightRAG finalization: {e}", exc_info=True)
+        await rag.finalize_storages()
+    print("Cleanup complete.")
 
 
 # ============================================================================
@@ -1002,12 +1013,12 @@ async def root():
 if __name__ == "__main__":
     import uvicorn
     
-    port = int(os.getenv("PORT", "8000"))
-    host = os.getenv("HOST", "0.0.0.0")
+    host = os.getenv("LIGHTRAG_HOST", "0.0.0.0")
+    port = int(os.getenv("LIGHTRAG_PORT", "8005"))
     
     uvicorn.run(
         "lightrag_fastapi:app",
         host=host,
         port=port,
-        reload=True,
+        reload=False,
     )

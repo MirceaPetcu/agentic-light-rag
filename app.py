@@ -9,42 +9,32 @@ This module provides endpoints for:
 
 import os
 import sys
+import traceback
+import logging
 from contextlib import asynccontextmanager
-from functools import partial
 from typing import Any
 
 import httpx
-from fastapi import FastAPI, HTTPException, UploadFile, File, Form
-from fastapi.responses import StreamingResponse
+from fastapi import FastAPI, HTTPException, UploadFile, File, Form, Request
+from fastapi.responses import StreamingResponse, JSONResponse
+from fastapi.exceptions import RequestValidationError
 from pydantic import BaseModel, Field
 
 # Add light_rag to the path for imports
 sys.path.insert(0, './light_rag')
 
-from lightrag import LightRAG, QueryParam
-from lightrag.llm.openai import openai_complete_if_cache
-from lightrag.llm.ollama import ollama_embed
-from lightrag.utils import EmbeddingFunc
+from lightrag import QueryParam
 
 # Configuration from environment
-WORKING_DIR = os.getenv("LIGHTRAG_WORKING_DIR", "./rag_storage")
-
 # Pipeline Service Configuration
-PIPELINE_SERVICE_URL = os.getenv("PIPELINE_SERVICE_URL", "http://localhost:10001")
+PIPELINE_HOST = os.getenv("PIPELINE_HOST", "http://localhost")
+PIPELINE_PORT = os.getenv("PIPELINE_PORT", "8003")
+PIPELINE_SERVICE_URL = f"http://{PIPELINE_HOST}:{PIPELINE_PORT}"
 
-# LightRAG Storage Configuration
-LIGHTRAG_GRAPH_STORAGE = os.getenv("LIGHTRAG_GRAPH_STORAGE", "NetworkXStorage")
-
-# LLM Configuration
-LLM_BINDING_HOST = os.getenv("LLM_BINDING_HOST", "https://api.deepseek.com")
-LLM_BINDING_API_KEY = os.getenv("LLM_BINDING_API_KEY", os.getenv("OPENAI_API_KEY", ""))
-LLM_MODEL = os.getenv("LLM_MODEL", "deepseek-chat")
-
-# Embedding Configuration
-EMBEDDING_MODEL = os.getenv("EMBEDDING_MODEL", "bge-m3:latest")
-EMBEDDING_HOST = os.getenv("EMBEDDING_BINDING_HOST", "http://localhost:11434")
-EMBEDDING_DIM = int(os.getenv("EMBEDDING_DIM", "1024"))
-MAX_EMBED_TOKENS = int(os.getenv("MAX_EMBED_TOKENS", "32768"))
+# LightRAG FastAPI Service Configuration
+LIGHTRAG_HOST = os.getenv("LIGHTRAG_HOST", "http://localhost")
+LIGHTRAG_PORT = os.getenv("LIGHTRAG_PORT", "8005")
+LIGHTRAG_SERVICE_URL = f"http://{LIGHTRAG_HOST}:{LIGHTRAG_PORT}"
 
 # Multi-agent configuration (defaults for query requests)
 MAX_STEPS = int(os.getenv("MAX_STEPS", "5"))
@@ -52,33 +42,17 @@ SIMILARITY_THRESHOLD = float(os.getenv("SIMILARITY_THRESHOLD", "0.75"))
 TOP_K = int(os.getenv("TOP_K", "10"))
 
 # Global instances
-rag: LightRAG | None = None
 http_client: httpx.AsyncClient | None = None
+http_sync_client: httpx.Client | None = None
+
+# Configure logging
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+)
+logger = logging.getLogger(__name__)
 
 
-# ============================================================================
-# LLM and Embedding Functions
-# ============================================================================
-
-async def llm_model_func(
-    prompt: str,
-    system_prompt: str | None = None,
-    history_messages: list = [],
-    keyword_extraction: bool = False,
-    **kwargs
-) -> str:
-    """LLM function for LightRAG using vLLM (OpenAI-compatible API)."""
-    return await openai_complete_if_cache(
-        model=LLM_MODEL,
-        prompt=prompt,
-        system_prompt=system_prompt,
-        history_messages=history_messages,
-        base_url=LLM_BINDING_HOST,
-        api_key=LLM_BINDING_API_KEY,
-        keyword_extraction=keyword_extraction,
-        timeout=600,
-        **kwargs,
-    )
 
 
 # ============================================================================
@@ -134,49 +108,25 @@ class HealthResponse(BaseModel):
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Manage application lifespan - initialize and cleanup resources."""
-    global rag, http_client
+    global http_client, http_sync_client
 
     # Startup
-    print("Initializing LightRAG...")
+    print("Initializing app...")
 
-    # Ensure working directory exists
-    os.makedirs(WORKING_DIR, exist_ok=True)
-
-    # Initialize LightRAG
-    # Neo4j configuration is automatically read from environment variables:
-    # NEO4J_URI, NEO4J_USERNAME, NEO4J_PASSWORD
-    rag = LightRAG(
-        working_dir=WORKING_DIR,
-        llm_model_func=llm_model_func,
-        embedding_func=EmbeddingFunc(
-            embedding_dim=EMBEDDING_DIM,
-            max_token_size=MAX_EMBED_TOKENS,
-            func=partial(
-                ollama_embed,
-                embed_model=EMBEDDING_MODEL,
-                host=EMBEDDING_HOST,
-            ),
-        ),
-        graph_storage=LIGHTRAG_GRAPH_STORAGE,
-        use_guided_json_extraction=True
-    )
-
-    await rag.initialize_storages()
-    print(f"LightRAG initialized with working directory: {WORKING_DIR}")
-    print(f"Graph storage backend: {LIGHTRAG_GRAPH_STORAGE}")
-
-    # Initialize HTTP client for pipeline service
+    # Initialize HTTP clients for communicating with LightRAG and Pipeline services
     http_client = httpx.AsyncClient(timeout=httpx.Timeout(600.0, connect=10.0))
+    http_sync_client = httpx.Client(timeout=httpx.Timeout(600.0, connect=10.0))
+    print(f"LightRAG service URL: {LIGHTRAG_SERVICE_URL}")
     print(f"Pipeline service URL: {PIPELINE_SERVICE_URL}")
 
     yield
 
     # Shutdown
     print("Shutting down...")
-    if rag:
-        await rag.finalize_storages()
     if http_client:
         await http_client.aclose()
+    if http_sync_client:
+        http_sync_client.close()
     print("Cleanup complete.")
 
 
@@ -193,8 +143,96 @@ app = FastAPI(
 
 
 # ============================================================================
+# Exception Handlers
+# ============================================================================
+
+@app.exception_handler(Exception)
+async def global_exception_handler(request: Request, exc: Exception):
+    """Global exception handler that logs full tracebacks."""
+    logger.error(
+        f"Unhandled exception: {type(exc).__name__}: {str(exc)}\n"
+        f"Full traceback:\n{traceback.format_exc()}",
+        exc_info=True
+    )
+    
+    # Print to console as well for immediate visibility
+    print(f"\n{'='*80}")
+    print(f"ERROR: {type(exc).__name__}: {str(exc)}")
+    print(f"{'='*80}")
+    traceback.print_exc()
+    print(f"{'='*80}\n")
+    
+    return JSONResponse(
+        status_code=500,
+        content={
+            "detail": str(exc),
+            "type": type(exc).__name__,
+            "traceback": traceback.format_exc() if os.getenv("DEBUG", "false").lower() == "true" else None
+        }
+    )
+
+
+@app.exception_handler(HTTPException)
+async def http_exception_handler(request: Request, exc: HTTPException):
+    """Handler for HTTPExceptions that logs tracebacks."""
+    logger.error(
+        f"HTTPException: {exc.status_code} - {exc.detail}\n"
+        f"Request: {request.method} {request.url}\n"
+        f"Full traceback:\n{traceback.format_exc()}",
+        exc_info=True
+    )
+    
+    # Print to console as well
+    print(f"\n{'='*80}")
+    print(f"HTTPException: {exc.status_code} - {exc.detail}")
+    print(f"Request: {request.method} {request.url}")
+    print(f"{'='*80}")
+    traceback.print_exc()
+    print(f"{'='*80}\n")
+    
+    return JSONResponse(
+        status_code=exc.status_code,
+        content={
+            "detail": exc.detail,
+            "status_code": exc.status_code
+        }
+    )
+
+
+@app.exception_handler(RequestValidationError)
+async def validation_exception_handler(request: Request, exc: RequestValidationError):
+    """Handler for validation errors."""
+    logger.error(
+        f"Validation error: {exc.errors()}\n"
+        f"Request: {request.method} {request.url}",
+        exc_info=True
+    )
+    
+    print(f"\n{'='*80}")
+    print(f"Validation Error: {exc.errors()}")
+    print(f"Request: {request.method} {request.url}")
+    print(f"{'='*80}\n")
+    
+    return JSONResponse(
+        status_code=422,
+        content={"detail": exc.errors(), "body": exc.body}
+    )
+
+
+# ============================================================================
 # Helper Functions
 # ============================================================================
+
+async def check_lightrag_service_health() -> bool:
+    """Check if the LightRAG service is healthy."""
+    if not http_client:
+        return False
+    try:
+        response = await http_client.get(f"{LIGHTRAG_SERVICE_URL}/health")
+        return response.status_code == 200
+    except Exception:
+        return False
+
 
 async def check_pipeline_service_health() -> bool:
     """Check if the pipeline service is healthy."""
@@ -242,9 +280,15 @@ async def stream_pipeline_sse(query_request: QueryRequest):
                 else:
                     yield "\n"
 
-    except httpx.ConnectError:
+    except httpx.ConnectError as e:
+        logger.error(f"Cannot connect to pipeline service: {str(e)}")
         yield f"event: error\ndata: {{\"error\": \"Cannot connect to pipeline service at {PIPELINE_SERVICE_URL}\"}}\n\n"
     except Exception as e:
+        logger.error(f"Stream error: {str(e)}\n{traceback.format_exc()}", exc_info=True)
+        print(f"\n{'='*80}")
+        print(f"Stream Error: {str(e)}")
+        traceback.print_exc()
+        print(f"{'='*80}\n")
         yield f"event: error\ndata: {{\"error\": \"Stream error: {str(e)}\"}}\n\n"
 
 
@@ -307,13 +351,22 @@ async def call_pipeline_service(query_request: QueryRequest) -> dict[str, Any]:
                     current_event = None
                     current_data = []
 
-    except httpx.ConnectError:
+    except httpx.ConnectError as e:
+        logger.error(f"Cannot connect to pipeline service: {str(e)}")
         raise HTTPException(
             status_code=503,
             detail=f"Cannot connect to pipeline service at {PIPELINE_SERVICE_URL}"
         )
+    except Exception as e:
+        logger.error(f"Pipeline service call failed: {str(e)}\n{traceback.format_exc()}", exc_info=True)
+        print(f"\n{'='*80}")
+        print(f"Pipeline Service Error: {str(e)}")
+        traceback.print_exc()
+        print(f"{'='*80}\n")
+        raise
 
     if final_result is None:
+        logger.error("No result received from pipeline service")
         raise HTTPException(status_code=500, detail="No result received from pipeline service")
 
     return final_result
@@ -326,11 +379,12 @@ async def call_pipeline_service(query_request: QueryRequest) -> dict[str, Any]:
 @app.get("/health", response_model=HealthResponse)
 async def health_check():
     """Health check endpoint."""
+    lightrag_healthy = await check_lightrag_service_health()
     pipeline_healthy = await check_pipeline_service_health()
 
     return HealthResponse(
         status="healthy",
-        rag_initialized=rag is not None,
+        rag_initialized=lightrag_healthy,
         pipeline_service_healthy=pipeline_healthy,
     )
 
@@ -338,37 +392,58 @@ async def health_check():
 @app.post("/ingest", response_model=IngestResponse)
 async def ingest_document(request: IngestRequest):
     """
-    Ingest a document into the LightRAG knowledge graph.
+    Ingest a document into the LightRAG knowledge graph via the LightRAG service.
 
-    This endpoint uses LightRAG's ingestion pipeline to:
+    This endpoint calls the LightRAG service's /ingest endpoint to:
     1. Chunk the document
     2. Extract entities and relationships
     3. Build the knowledge graph
     4. Store embeddings for retrieval
     """
-    if not rag:
-        raise HTTPException(status_code=503, detail="LightRAG not initialized")
+    if not http_sync_client:
+        raise HTTPException(status_code=503, detail="HTTP client not initialized")
 
     try:
-        # Prepare input parameters
-        ids = [request.doc_id] if request.doc_id else None
-        file_paths = [request.file_path] if request.file_path else None
+        # Prepare request body for LightRAG service
+        ingest_request = {
+            "text": request.content,
+        }
+        if request.file_path:
+            ingest_request["file_path"] = request.file_path
 
-        # Use LightRAG's async insert
-        track_id = await rag.ainsert(
-            input=request.content,
-            ids=ids,
-            file_paths=file_paths,
+        # Call LightRAG service /ingest endpoint using sync client
+        response = http_sync_client.post(
+            f"{LIGHTRAG_SERVICE_URL}/ingest",
+            json=ingest_request,
         )
+        response.raise_for_status()
+
+        result = response.json()
 
         return IngestResponse(
-            status="success",
-            message="Document ingested successfully",
-            track_id=track_id,
+            status=result.get("status", "success"),
+            message=result.get("message", "Document ingested successfully"),
+            track_id=result.get("track_id"),
             doc_id=request.doc_id,
         )
 
+    except httpx.ConnectError:
+        raise HTTPException(
+            status_code=503,
+            detail=f"Cannot connect to LightRAG service at {LIGHTRAG_SERVICE_URL}"
+        )
+    except httpx.HTTPStatusError as e:
+        logger.error(f"LightRAG service HTTP error: {e.response.status_code} - {e.response.text}")
+        raise HTTPException(
+            status_code=e.response.status_code,
+            detail=f"LightRAG service error: {e.response.text}"
+        )
     except Exception as e:
+        logger.error(f"Ingestion failed: {str(e)}\n{traceback.format_exc()}", exc_info=True)
+        print(f"\n{'='*80}")
+        print(f"Ingestion Error: {str(e)}")
+        traceback.print_exc()
+        print(f"{'='*80}\n")
         raise HTTPException(status_code=500, detail=f"Ingestion failed: {str(e)}")
 
 
@@ -378,21 +453,16 @@ async def ingest_file(
     doc_id: str | None = Form(None),
 ):
     """
-    Ingest a file into the LightRAG knowledge graph.
+    Ingest a file into the LightRAG knowledge graph via the LightRAG service.
 
     Supports text files (.txt, .md, .json, etc.)
     """
-    if not rag:
-        raise HTTPException(status_code=503, detail="LightRAG not initialized")
+    if not http_sync_client:
+        raise HTTPException(status_code=503, detail="HTTP client not initialized")
 
     try:
-
-        # Prepare input parameters
-        ids = [doc_id] if doc_id else None
-        file_paths = [file.filename] if file.filename else None
-
         import tempfile
-        import textract
+        import fitz  # PyMuPDF
         import os as os_module
 
         # Save the uploaded file to a temporary file
@@ -401,26 +471,41 @@ async def ingest_file(
             temp_file_path = temp_file.name
 
         try:
-            # Extract text content from the temporary file
-            # Use errors='replace' to handle encoding issues gracefully
-            text_bytes = textract.process(temp_file_path)
-            text_content = text_bytes.decode("utf-8", errors="replace")
+            # Extract text content from PDF using PyMuPDF
+            doc = fitz.open(temp_file_path)
+            text_content = ""
+            for page in doc:
+                text_content += page.get_text()
+            doc.close()
+            
+            # Handle encoding issues gracefully
+            if isinstance(text_content, bytes):
+                text_content = text_content.decode("utf-8", errors="replace")
 
             # Clean up any replacement characters if needed
             if not text_content.strip():
                 raise ValueError("No text content could be extracted from the file")
 
-            # Use LightRAG's async insert
-            track_id = await rag.ainsert(
-                input=text_content,
-                ids=ids,
-                file_paths=file_paths,
+            # Prepare request body for LightRAG service
+            ingest_request = {
+                "text": text_content,
+            }
+            if file.filename:
+                ingest_request["file_path"] = file.filename
+
+            # Call LightRAG service /ingest endpoint using sync client
+            response = http_sync_client.post(
+                f"{LIGHTRAG_SERVICE_URL}/ingest",
+                json=ingest_request,
             )
+            response.raise_for_status()
+
+            result = response.json()
 
             return IngestResponse(
-                status="success",
+                status=result.get("status", "success"),
                 message=f"File '{file.filename}' ingested successfully",
-                track_id=track_id,
+                track_id=result.get("track_id"),
                 doc_id=doc_id,
             )
         finally:
@@ -431,8 +516,25 @@ async def ingest_file(
                 pass
 
     except ValueError as ve:
+        logger.error(f"File ingestion validation error: {str(ve)}")
         raise HTTPException(status_code=400, detail=str(ve))
+    except httpx.ConnectError:
+        raise HTTPException(
+            status_code=503,
+            detail=f"Cannot connect to LightRAG service at {LIGHTRAG_SERVICE_URL}"
+        )
+    except httpx.HTTPStatusError as e:
+        logger.error(f"LightRAG service HTTP error: {e.response.status_code} - {e.response.text}")
+        raise HTTPException(
+            status_code=e.response.status_code,
+            detail=f"LightRAG service error: {e.response.text}"
+        )
     except Exception as e:
+        logger.error(f"File ingestion failed: {str(e)}\n{traceback.format_exc()}", exc_info=True)
+        print(f"\n{'='*80}")
+        print(f"File Ingestion Error: {str(e)}")
+        traceback.print_exc()
+        print(f"{'='*80}\n")
         raise HTTPException(status_code=500, detail=f"File ingestion failed: {str(e)}")
 
 
@@ -485,31 +587,56 @@ async def query(request: QueryRequest):
 @app.post("/query/simple")
 async def query_simple(request: QueryRequest):
     """
-    Simple query endpoint that uses LightRAG directly without the multi-agent pipeline.
+    Simple query endpoint that uses the LightRAG service directly without the multi-agent pipeline.
 
     Useful for quick queries or debugging.
     """
-    if not rag:
-        raise HTTPException(status_code=503, detail="LightRAG not initialized")
+    if not await check_lightrag_service_health():
+        raise HTTPException(
+            status_code=503,
+            detail=f"LightRAG service not available at {LIGHTRAG_SERVICE_URL}"
+        )
 
     if not request.query.strip():
         raise HTTPException(status_code=400, detail="Query cannot be empty")
 
     try:
-        param = QueryParam(
-            mode="mix",
-            top_k=request.top_k,
+        # Call LightRAG service /query endpoint
+        response = await http_client.post(
+            f"{LIGHTRAG_SERVICE_URL}/query",
+            json={
+                "query": request.query,
+                "mode": "mix",
+                "top_k": request.top_k,
+            },
         )
+        response.raise_for_status()
 
-        response = await rag.aquery(request.query, param=param)
+        result = response.json()
 
         return {
             "status": "success",
-            "response": response,
+            "response": result.get("response", ""),
             "query": request.query,
         }
 
+    except httpx.ConnectError:
+        raise HTTPException(
+            status_code=503,
+            detail=f"Cannot connect to LightRAG service at {LIGHTRAG_SERVICE_URL}"
+        )
+    except httpx.HTTPStatusError as e:
+        logger.error(f"LightRAG service HTTP error: {e.response.status_code} - {e.response.text}")
+        raise HTTPException(
+            status_code=e.response.status_code,
+            detail=f"LightRAG service error: {e.response.text}"
+        )
     except Exception as e:
+        logger.error(f"Query failed: {str(e)}\n{traceback.format_exc()}", exc_info=True)
+        print(f"\n{'='*80}")
+        print(f"Query Error: {str(e)}")
+        traceback.print_exc()
+        print(f"{'='*80}\n")
         raise HTTPException(status_code=500, detail=f"Query failed: {str(e)}")
 
 
@@ -518,17 +645,23 @@ async def get_ingestion_status(track_id: str):
     """
     Get the status of a document ingestion job.
     """
-    if not rag:
-        raise HTTPException(status_code=503, detail="LightRAG not initialized")
+    if not http_sync_client:
+        raise HTTPException(status_code=503, detail="HTTP client not initialized")
 
     try:
-        # Check pipeline status
-        status = await rag.get_pipeline_status(track_id)
+        # Note: This endpoint may need to be implemented in the LightRAG service
+        # For now, we return a placeholder response
         return {
             "track_id": track_id,
-            "status": status,
+            "status": "processing",
+            "message": "Status tracking will be implemented via LightRAG service"
         }
     except Exception as e:
+        logger.error(f"Failed to get status: {str(e)}\n{traceback.format_exc()}", exc_info=True)
+        print(f"\n{'='*80}")
+        print(f"Status Error: {str(e)}")
+        traceback.print_exc()
+        print(f"{'='*80}\n")
         raise HTTPException(status_code=500, detail=f"Failed to get status: {str(e)}")
 
 
@@ -540,11 +673,11 @@ if __name__ == "__main__":
     import uvicorn
 
     host = os.getenv("HOST", "0.0.0.0")
-    port = int(os.getenv("PORT", "10000"))
+    port = int(os.getenv("PORT", "8000"))
 
     uvicorn.run(
         "app:app",
         host=host,
         port=port,
-        reload=True,
+        reload=False,
     )

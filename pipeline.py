@@ -41,7 +41,9 @@ ZAI_API_KEY = os.getenv("ZAI_API_KEY", "")
 ZAI_MODEL = os.getenv("ZAI_MODEL", "glm-4.7-flash")
 
 # LightRAG Service Configuration (container)
-LIGHTRAG_SERVICE_URL = os.getenv("LIGHTRAG_SERVICE_URL", "http://lightrag:9621")
+LIGHTRAG_HOST = os.getenv("LIGHTRAG_HOST", "http://localhost")
+LIGHTRAG_PORT = os.getenv("LIGHTRAG_PORT", "8005")
+LIGHTRAG_SERVICE_URL = f"http://{LIGHTRAG_HOST}:{LIGHTRAG_PORT}"
 LIGHTRAG_API_KEY = os.getenv("LIGHTRAG_API_KEY", "")
 
 # LLM Configuration
@@ -448,6 +450,7 @@ async def run_pipeline_with_sse(
                 "limitations": response_result.get("limitations", []),
             }
         }
+        print(result)
 
         # Update job status
         pipeline_jobs[job_id] = {"status": "completed", "progress": 100, "result": result}
@@ -589,11 +592,11 @@ if __name__ == "__main__":
     import uvicorn
 
     host = os.getenv("PIPELINE_HOST", "0.0.0.0")
-    port = int(os.getenv("PIPELINE_PORT", "10001"))
+    port = int(os.getenv("PIPELINE_PORT", "8003"))
 
     uvicorn.run(
         "pipeline:app",
         host=host,
         port=port,
-        reload=True,
+        reload=False,
     )
