@@ -18,11 +18,6 @@ import httpx
 from base_agent import BaseAgent
 from observation import Observation
 
-# Add light_rag to the path for imports
-import sys
-sys.path.insert(0, './light_rag')
-
-from lightrag import LightRAG, QueryParam
 
 
 @dataclass
@@ -114,7 +109,8 @@ class RetrieverAgent(BaseAgent):
     def __init__(
         self,
         name: str = "RetrieverAgent",
-        lightrag: LightRAG | None = None,
+        lightrag_base_url: str = "http://lightrag:9621",
+        lightrag_api_key: str = "",
         top_k: int = 10,
         query_mode: str = "mix",
         colbert_base_url: str = "http://localhost:8002",
@@ -124,27 +120,44 @@ class RetrieverAgent(BaseAgent):
 
         Args:
             name: Agent name
-            lightrag: LightRAG instance for querying the knowledge graph
+            lightrag_base_url: Base URL for the LightRAG service container
+            lightrag_api_key: API key for LightRAG service (optional)
             top_k: Number of top results to return after RRF
             query_mode: LightRAG query mode ("local", "global", "hybrid", "mix", "naive")
             colbert_base_url: Base URL for the ColBERT service
         """
         super().__init__(name)
-        self.lightrag = lightrag
+        self.lightrag_base_url = lightrag_base_url.rstrip("/")
+        self.lightrag_api_key = lightrag_api_key
         self.top_k = top_k
         self.query_mode = query_mode
         self.colbert_base_url = colbert_base_url.rstrip("/")
         self._http_client = None
+        self._lightrag_client = None
 
         # In-memory storage for retrieval results (keyed by query hash)
         self._memory: dict[str, RetrieverResult] = {}
 
     @property
     def http_client(self) -> httpx.AsyncClient:
-        """Lazy initialize async HTTP client."""
+        """Lazy initialize async HTTP client for ColBERT."""
         if self._http_client is None:
             self._http_client = httpx.AsyncClient(timeout=60.0)
         return self._http_client
+    
+    @property
+    def lightrag_client(self) -> httpx.AsyncClient:
+        """Lazy initialize async HTTP client for LightRAG service."""
+        if self._lightrag_client is None:
+            headers = {}
+            if self.lightrag_api_key:
+                headers["X-API-Key"] = self.lightrag_api_key
+            self._lightrag_client = httpx.AsyncClient(
+                base_url=self.lightrag_base_url,
+                timeout=httpx.Timeout(600.0, connect=10.0),
+                headers=headers
+            )
+        return self._lightrag_client
     
     async def act(
         self,
@@ -365,7 +378,7 @@ class RetrieverAgent(BaseAgent):
         mode: str | None = None,
     ) -> list[RetrievedContext]:
         """
-        Retrieve context from LightRAG for a single query.
+        Retrieve context from LightRAG service for a single query.
 
         Args:
             query: The query string
@@ -375,27 +388,32 @@ class RetrieverAgent(BaseAgent):
         Returns:
             List of RetrievedContext items
         """
-        if not self.lightrag:
-            return []
-
         # Use provided mode or fall back to instance default
         effective_mode = mode if mode is not None else self.query_mode
 
-        # Create query parameters - only get context, no LLM generation
-        param = QueryParam(
-            mode=effective_mode,
-            only_need_context=True,
-            only_need_prompt=False,
-            top_k=self.top_k * 2,  # Retrieve more to have enough after fusion
-        )
-        
-        # Query LightRAG - this returns only context, not LLM answer
-        result = await self.lightrag.aquery_data(query, param)
-        
-        # Parse the result into RetrievedContext objects
-        contexts = self._parse_lightrag_result(result, query)
-        
-        return contexts
+        try:
+            # Query LightRAG service - use /query/data endpoint to get only context
+            client = self.lightrag_client
+            response = await client.post(
+                "/query/data",
+                json={
+                    "query": query,
+                    "mode": effective_mode,
+                    "only_need_context": True,
+                    "top_k": self.top_k * 2,  # Retrieve more to have enough after fusion
+                }
+            )
+            response.raise_for_status()
+            result = response.json()
+            
+            # Parse the result into RetrievedContext objects
+            contexts = self._parse_lightrag_result(result, query)
+            
+            return contexts
+        except Exception as e:
+            # Log error but return empty list to allow pipeline to continue
+            print(f"Error retrieving from LightRAG service: {e}")
+            return []
     
     def _parse_lightrag_result(
         self,
@@ -403,10 +421,10 @@ class RetrieverAgent(BaseAgent):
         source_query: str,
     ) -> list[RetrievedContext]:
         """
-        Parse LightRAG query result into RetrievedContext objects.
+        Parse LightRAG service query result into RetrievedContext objects.
         
         Args:
-            result: Raw result from LightRAG aquery_data
+            result: Raw result from LightRAG /query/data endpoint
             source_query: The query that produced this result
             
         Returns:

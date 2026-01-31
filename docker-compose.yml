@@ -1,9 +1,12 @@
 services:
+  # =============================================================================
+  # Database Services
+  # =============================================================================
   neo4j:
     image: neo4j:latest
     container_name: neo4j-lightrag
     ports:
-      - "7474:7474"  # HTTP
+      - "7474:7474"  # HTTP Browser
       - "7687:7687"  # Bolt
     environment:
       NEO4J_AUTH: neo4j/password
@@ -13,50 +16,24 @@ services:
       - neo4j_data:/data
       - neo4j_logs:/logs
     restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:7474"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 30s
 
-  # vllm:
-  #   image: vllm/vllm-openai:latest
-  #   container_name: vllm-server-openai-gpt-oss-20b
-  #   ports:
-  #     - "8000:8000"
-  #   environment:
-  #     # GPU settings
-  #     - NVIDIA_VISIBLE_DEVICES=all
-  #     # HuggingFace token for gated models
-  #     - HUGGING_FACE_HUB_TOKEN=$HF_TOKEN
-  #   deploy:
-  #     resources:
-  #       reservations:
-  #         devices:
-  #           - driver: nvidia
-  #             count: all
-  #             capabilities: [gpu]
-  #   command: 
-  #     --model openai/gpt-oss-20b
-  #     --host 0.0.0.0
-  #     --port 8000
-  #     --max-model-len 8192
-  #   volumes:
-  #     # Cache HuggingFace models locally
-  #     - ./model_cache:/root/.cache/huggingface
-  #   restart: unless-stopped
-  #   healthcheck:
-  #     test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
-  #     interval: 30s
-  #     timeout: 10s
-  #     retries: 3
-  #     start_period: 60s
-      
-  vllm-gemma:
+  # =============================================================================
+  # LLM Services
+  # =============================================================================
+  vllm:
     image: vllm/vllm-openai:latest
-    container_name: vllm-server-gemma-2-2b-it
+    container_name: vllm-server
     ports:
       - "8001:8000"
     environment:
-      # GPU settings
       - NVIDIA_VISIBLE_DEVICES=all
-      # HuggingFace token for gated models
-      - HUGGING_FACE_HUB_TOKEN=$HF_TOKEN
+      - HUGGING_FACE_HUB_TOKEN=${HF_TOKEN:-}
     deploy:
       resources:
         reservations:
@@ -64,13 +41,12 @@ services:
             - driver: nvidia
               count: all
               capabilities: [gpu]
-    command: 
-      --model LiquidAI/LFM2-2.6B
+    command:
+      --model ${VLLM_MODEL:-LiquidAI/LFM2-2.6B}
       --host 0.0.0.0
       --port 8000
-      --max-model-len 32768
+      --max-model-len ${VLLM_MAX_MODEL_LEN:-32768}
     volumes:
-      # Cache HuggingFace models locally
       - ./model_cache:/root/.cache/huggingface
     restart: unless-stopped
     healthcheck:
@@ -78,9 +54,170 @@ services:
       interval: 30s
       timeout: 10s
       retries: 3
+      start_period: 120s
+
+  ollama:
+    image: ollama/ollama:latest
+    container_name: ollama-lightrag
+    ports:
+      - "11434:11434"
+    volumes:
+      - ollama_data:/root/.ollama
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:11434/api/tags"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 30s
+
+  # =============================================================================
+  # ColBERT Embeddings Service
+  # =============================================================================
+  colbert:
+    build:
+      context: .
+      dockerfile: Dockerfile.colbert
+    container_name: colbert-service
+    ports:
+      - "8002:8002"
+    environment:
+      - COLBERT_MODEL=${COLBERT_MODEL:-colbert-ir/colbertv2.0}
+      - COLBERT_DEVICE=${COLBERT_DEVICE:-cpu}
+    volumes:
+      - ./model_cache:/app/model_cache
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8002/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
       start_period: 60s
+
+  # =============================================================================
+  # LightRAG FastAPI Server
+  # =============================================================================
+  lightrag-fastapi:
+    build:
+      context: .
+      dockerfile: Dockerfile.lightrag_fastapi
+    container_name: lightrag-fastapi-server
+    ports:
+      - "8000:8000"
+    environment:
+      # LightRAG Configuration
+      - LIGHTRAG_WORKING_DIR=/app/rag_storage
+      - WORKSPACE=${WORKSPACE:-default}
+      # Storage Configuration
+      - KV_STORAGE=${KV_STORAGE:-JsonKVStorage}
+      - VECTOR_STORAGE=${VECTOR_STORAGE:-NanoVectorDBStorage}
+      - GRAPH_STORAGE=${GRAPH_STORAGE:-NetworkXStorage}
+      - DOC_STATUS_STORAGE=${DOC_STATUS_STORAGE:-JsonDocStatusStorage}
+      # LLM Configuration
+      - LLM_BINDING_HOST=${LLM_BINDING_HOST:-http://vllm:8000/v1}
+      - LLM_BINDING_API_KEY=${LLM_BINDING_API_KEY:-EMPTY}
+      - LLM_MODEL=${LLM_MODEL:-LiquidAI/LFM2-2.6B}
+      # Embedding Configuration (Ollama)
+      - EMBEDDING_MODEL=${EMBEDDING_MODEL:-bge-m3:latest}
+      - EMBEDDING_BINDING_HOST=${EMBEDDING_BINDING_HOST:-http://ollama:11434}
+      - EMBEDDING_DIM=${EMBEDDING_DIM:-1024}
+      - MAX_EMBED_TOKENS=${MAX_EMBED_TOKENS:-32768}
+      # Server Configuration
+      - HOST=0.0.0.0
+      - PORT=8000
+    volumes:
+      - ./rag_storage:/app/rag_storage
+    depends_on:
+      ollama:
+        condition: service_healthy
+      vllm:
+        condition: service_healthy
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 30s
+
+  # =============================================================================
+  # Main Application (Multi-Agent LightRAG API)
+  # =============================================================================
+  # app:
+  #   build:
+  #     context: .
+  #     dockerfile: Dockerfile.app
+  #   container_name: multiagent-lightrag-api
+  #   ports:
+  #     - "10000:10000"
+  #   environment:
+  #     # LightRAG Configuration
+  #     - LIGHTRAG_WORKING_DIR=/app/rag_storage
+  #     - LIGHTRAG_GRAPH_STORAGE=Neo4JStorage
+  #     - LIGHTRAG_KV_STORAGE=JsonKVStorage
+  #     - LIGHTRAG_VECTOR_STORAGE=NanoVectorDBStorage
+  #     # Neo4j
+  #     - NEO4J_URI=bolt://neo4j:7687
+  #     - NEO4J_USERNAME=neo4j
+  #     - NEO4J_PASSWORD=password
+  #     # Redis
+  #     - REDIS_URL=redis://redis:6379
+  #     # LLM Configuration (vLLM)
+  #     - VLLM_BASE_URL=http://vllm:8000/v1
+  #     - VLLM_API_KEY=EMPTY
+  #     - VLLM_MODEL=${VLLM_MODEL:-LiquidAI/LFM2-2.6B}
+  #     - LLM_BINDING_HOST=http://vllm:8000/v1
+  #     - LLM_BINDING_API_KEY=EMPTY
+  #     - LLM_MODEL=${VLLM_MODEL:-LiquidAI/LFM2-2.6B}
+  #     # Embedding (Ollama)
+  #     - EMBEDDING_MODEL=${EMBEDDING_MODEL:-nomic-embed-text:latest}
+  #     - EMBEDDING_BINDING_HOST=http://ollama:11434
+  #     - EMBEDDING_DIM=${EMBEDDING_DIM:-768}
+  #     # ColBERT Service
+  #     - COLBERT_SERVICE_URL=http://colbert:8002
+  #     # Multi-agent settings
+  #     - MAX_STEPS=${MAX_STEPS:-5}
+  #     - SIMILARITY_THRESHOLD=${SIMILARITY_THRESHOLD:-0.75}
+  #     - TOP_K=${TOP_K:-10}
+  #   volumes:
+  #     - ./rag_storage:/app/rag_storage
+  #   depends_on:
+  #     neo4j:
+  #       condition: service_healthy
+  #     redis:
+  #       condition: service_healthy
+  #     ollama:
+  #       condition: service_healthy
+  #   restart: unless-stopped
+  #   healthcheck:
+  #     test: ["CMD", "curl", "-f", "http://localhost:10000/health"]
+  #     interval: 30s
+  #     timeout: 10s
+  #     retries: 3
+  #     start_period: 30s
+
+  # # =============================================================================
+  # # Frontend
+  # # =============================================================================
+  # frontend:
+  #   build:
+  #     context: ./frontend
+  #     dockerfile: Dockerfile
+  #   container_name: multiagent-frontend
+  #   ports:
+  #     - "3000:80"
+  #   depends_on:
+  #     - app
+  #   restart: unless-stopped
+  #   healthcheck:
+  #     test: ["CMD", "curl", "-f", "http://localhost:80"]
+  #     interval: 30s
+  #     timeout: 10s
+  #     retries: 3
 
 
 volumes:
   neo4j_data:
   neo4j_logs:
+  redis_data:
+  ollama_data:
