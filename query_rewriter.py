@@ -56,13 +56,9 @@ class QueryRewriterAgent(BaseAgent):
         """
         # Build user message with optional context
         if context:
-            user_message = f"""GLOBAL CONTEXT FROM KNOWLEDGE BASE:
-{context}
-
-USER QUERY:
-{query}"""
+            user_message = f"GLOBAL CONTEXT FROM KNOWLEDGE BASE: {context}\n\nUSER QUERY: {query}"
         else:
-            user_message = query
+            user_message = f"USER QUERY: {query}"
 
         completion = await self.client.chat.completions.create(
             model=self.model,

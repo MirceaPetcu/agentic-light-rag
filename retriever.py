@@ -129,7 +129,6 @@ class RetrieverAgent(BaseAgent):
         super().__init__(name)
         self.lightrag_base_url = lightrag_base_url.rstrip("/")
         self.lightrag_api_key = lightrag_api_key
-        self.lightrag = None
         self.top_k = top_k
         self.query_mode = query_mode
         self.colbert_base_url = colbert_base_url.rstrip("/")
@@ -229,12 +228,10 @@ class RetrieverAgent(BaseAgent):
         Returns:
             RetrieverResult with fused contexts
         """
-        if not self.lightrag:
-            raise ValueError("LightRAG instance is required for retrieval")
 
         # Retrieve contexts for all subqueries in parallel
         retrieval_tasks = [
-            self._retrieve_for_query(query, mode=mode) for query in subqueries
+            self._retrieve_for_query(query, mode=mode) for query in list(set(subqueries + [original_query]))
         ]
         query_results = await asyncio.gather(*retrieval_tasks)
 

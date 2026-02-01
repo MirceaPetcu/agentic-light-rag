@@ -166,9 +166,9 @@ def create_agents(
     return {
         "query_rewriter": QueryRewriterAgent(
             name="query_rewriter",
-            base_url=ZAI_BASE_URL,
-            api_key=ZAI_API_KEY,
-            model=ZAI_MODEL,
+            base_url=VLLM_BASE_URL,
+            api_key=VLLM_API_KEY,
+            model=VLLM_MODEL,
         ),
         "retriever": RetrieverAgent(
             name="retriever",
@@ -179,22 +179,22 @@ def create_agents(
         ),
         "deducer": DeducerAgent(
             name="deducer",
-            base_url=ZAI_BASE_URL,
-            api_key=ZAI_API_KEY,
-            model=ZAI_MODEL,
+            base_url=VLLM_BASE_URL,
+            api_key=VLLM_API_KEY,
+            model=VLLM_MODEL,
         ),
         "judge": JudgeAgent(
             name="judge",
-            base_url=ZAI_BASE_URL,
-            api_key=ZAI_API_KEY,
-            model=ZAI_MODEL,
+            base_url=VLLM_BASE_URL,
+            api_key=VLLM_API_KEY,
+            model=VLLM_MODEL,
             similarity_threshold=similarity_threshold,
         ),
         "response": ResponseAgent(
             name="response",
-            base_url=ZAI_BASE_URL,
-            api_key=ZAI_API_KEY,
-            model=ZAI_MODEL,
+            base_url=VLLM_BASE_URL,
+            api_key=VLLM_API_KEY,
+            model=VLLM_MODEL,
         ),
     }
 
@@ -245,21 +245,6 @@ async def run_pipeline_with_sse(
         judge = agents["judge"]
         response_agent = agents["response"]
 
-        # Step 0: Get global context
-        yield format_sse("progress", {
-            "job_id": job_id,
-            "stage": "global_context",
-            "message": "Gathering global context from knowledge base..."
-        })
-
-        global_context_result = await retriever.act(Observation(
-            original_query=query,
-            subqueries=[query],
-            step=0,
-            max_steps=max_steps,
-            similarity_threshold=similarity_threshold,
-        ), mode='global')
-        global_context = retriever.get_context_as_string(global_context_result)
 
         # Step 1 & 2: Decompose query
         yield format_sse("progress", {
@@ -268,9 +253,9 @@ async def run_pipeline_with_sse(
             "message": "Decomposing query into subqueries..."
         })
 
-        decomposition = await query_rewriter._decompose_query(query, context=global_context)
-        subqueries = [sq.canonical_form for sq in decomposition.subqueries]
-
+        # decomposition = await query_rewriter._decompose_query(query)
+        # subqueries = [sq.canonical_form for sq in decomposition.subqueries]
+        subqueries = None
         if not subqueries:
             subqueries = [query]
 

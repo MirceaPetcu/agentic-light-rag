@@ -348,6 +348,7 @@ async def call_pipeline_service(query_request: QueryRequest) -> dict[str, Any]:
                                 )
                         except json.JSONDecodeError:
                             pass
+                    logger.info(f"Received event: {current_event} with data: {data_str}")
                     current_event = None
                     current_data = []
 
