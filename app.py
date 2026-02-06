@@ -967,7 +967,6 @@ async def get_document_statuses(request: DocumentStatusRequest):
     documents = fetch_document_statuses(request.document_ids)
     return DocumentStatusResponse(documents=documents)
 
-
 @app.get("/reasoning_trace/{query_id}")
 async def get_reasoning_trace(query_id: str):
     """Fetch the reasoning trace for a given query ID."""

@@ -1,9 +1,5 @@
-import { useCallback, useEffect, useMemo, useRef } from 'react';
-import { useLocation, useNavigate } from 'react-router-dom';
+import { useCallback, useEffect, useRef } from 'react';
 import {
-  MessageSquare,
-  BookOpen,
-  Upload,
   FileText,
   Image,
   File,
@@ -20,12 +16,6 @@ import type { ChatAttachment, IngestionStatus } from '../types';
 interface LayoutProps {
   children: React.ReactNode;
 }
-
-const navItems = [
-  { path: '/', label: 'Chat', icon: MessageSquare },
-  { path: '/query', label: 'Queries', icon: BookOpen },
-  { path: '/ingest', label: 'Ingest', icon: Upload },
-];
 
 const STATUS_POLL_INTERVAL = 30_000;
 
@@ -44,8 +34,6 @@ const getFileIcon = (type: string) => {
 };
 
 export default function Layout({ children }: LayoutProps) {
-  const navigate = useNavigate();
-  const location = useLocation();
   const fileInputRef = useRef<HTMLInputElement>(null);
   const { documents, addDocuments, removeDocument, updateDocumentMeta } = useDocuments();
   const documentsRef = useRef<ChatAttachment[]>(documents);
@@ -58,8 +46,6 @@ export default function Layout({ children }: LayoutProps) {
     documentsRef.current = documents;
   }, [documents]);
 
-  const activePath = useMemo(() => location.pathname, [location.pathname]);
-  
   const normalizeBackendStatus = (status: string): IngestionStatus => {
     const lowered = status.toLowerCase();
     if (lowered === 'uploaded') return 'uploaded';
@@ -187,25 +173,6 @@ export default function Layout({ children }: LayoutProps) {
 
   return (
     <div className="app-shell">
-      <div className="nav-rail">
-        {navItems.map((item) => {
-          const Icon = item.icon;
-          const isActive = activePath === item.path;
-          return (
-            <button
-              key={item.path}
-              className={`nav-rail__item ${isActive ? 'is-active' : ''}`}
-              onClick={() => navigate(item.path)}
-              aria-label={item.label}
-            >
-              <Icon className="icon" />
-              <span>{item.label}</span>
-            </button>
-          );
-        })}
-
-      </div>
-
       <aside className="sidebar">
         <div className="sidebar-header">
           <label>Documents</label>
@@ -231,9 +198,6 @@ export default function Layout({ children }: LayoutProps) {
             <div className="no-docs">
               <FileText className="icon" />
               <p>No documents attached</p>
-              <button onClick={() => fileInputRef.current?.click()}>
-                Add documents
-              </button>
             </div>
           ) : (
             documents.map((doc) => {

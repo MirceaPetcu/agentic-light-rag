@@ -121,9 +121,9 @@ export default function ChatPage() {
       <div className="messages-area">
         {messages.length === 0 && !isTyping ? (
           <div className="chat-hero">
-            <div className="logo-bubble">KG</div>
-            <h1>Knowledge Graph</h1>
-            <p>Connect your documents. Discover relationships. Get answers powered by graph-based reasoning.</p>
+            <div className="logo-bubble">ALR</div>
+            <h1>Agentic LightRag</h1>
+            <p>Connect your documents. Discover relationships. Get answers powered by agentic graph-based reasoning.</p>
           </div>
         ) : (
           <div className="messages-scroll">

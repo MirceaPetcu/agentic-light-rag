@@ -152,7 +152,7 @@ a {
 /* Layout for Chat UI design */
 .app-shell {
   display: grid;
-  grid-template-columns: 74px 320px 1fr;
+  grid-template-columns: 320px 1fr;
   height: 100vh;
   width: 100vw;
   background: radial-gradient(circle at 20% 20%, hsl(var(--gradient-start) / 0.35), transparent 28%),
@@ -846,13 +846,13 @@ a {
 }
 
 @media (max-width: 1024px) {
-  .app-shell { grid-template-columns: 74px 1fr; }
+  .app-shell { grid-template-columns: 1fr; }
   .sidebar { display: none; }
   .chat-content { padding: 12px; }
 }
 
 @media (max-width: 720px) {
-  .app-shell { grid-template-columns: 74px 1fr; }
+  .app-shell { grid-template-columns: 1fr; }
   .top-bar { padding: 12px; }
   .chat-screen { border: none; box-shadow: none; }
   .bubble { font-size: 14px; }
