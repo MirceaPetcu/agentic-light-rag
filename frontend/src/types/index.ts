@@ -44,6 +44,7 @@ export interface QueryMetadata {
   subqueries_used: string[];
   key_points: string[];
   limitations: string[];
+  query_id?: string;
 }
 
 export interface QueryResponse {
@@ -95,6 +96,12 @@ export interface ChatMessage {
   timestamp: Date;
   isLoading?: boolean;
   citations?: Citation[];
+  queryId?: string;
+}
+
+export interface ReasoningTraceResponse {
+  query_id: string;
+  reasoning_trace: Record<string, unknown>;
 }
 
 export interface DocumentStatus {

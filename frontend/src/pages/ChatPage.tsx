@@ -1,8 +1,11 @@
-import { useEffect, useRef, useState } from 'react';
-import { Send, FileText, Image, File, Loader2 } from 'lucide-react';
-import type { ChatMessage } from '../types';
+import { useEffect, useRef, useState, useCallback } from 'react';
+import { Send, FileText, Image, File, Loader2, X, Brain } from 'lucide-react';
+import type { ChatMessage, Citation } from '../types';
 import { api, ApiError } from '../services/api';
+import ReasoningTraceModal from '../components/ReasoningTraceModal';
 import { useDocuments } from '../contexts/DocumentContext';
+import { useQueryParams } from '../contexts/QueryParamsContext';
+import QueryParamsPanel from '../components/QueryParamsPanel';
 
 const generateId = () => Math.random().toString(36).substring(2, 11);
 
@@ -17,9 +20,14 @@ export default function ChatPage() {
   const [input, setInput] = useState('');
   const [isTyping, setIsTyping] = useState(false);
   const [status, setStatus] = useState<string | null>(null);
+  const [activeCitation, setActiveCitation] = useState<Citation | null>(null);
+  const [traceQueryId, setTraceQueryId] = useState<string | null>(null);
+
+  const closeCitation = useCallback(() => setActiveCitation(null), []);
   const messagesEndRef = useRef<HTMLDivElement>(null);
   const textareaRef = useRef<HTMLTextAreaElement>(null);
   const { documents, clearDocuments } = useDocuments();
+  const { params } = useQueryParams();
 
   const scrollToBottom = () => {
     messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' });
@@ -72,13 +80,14 @@ export default function ChatPage() {
     setStatus(null);
 
     try {
-      const response = await api.query.advanced({ query: currentInput.trim(), stream: false });
+      const response = await api.query.advanced({ query: currentInput.trim(), ...params });
 
       const assistantMessage: ChatMessage = {
         id: generateId(),
         role: 'assistant',
         content: response.response,
         citations: response.citations,
+        queryId: response.metadata?.query_id,
         timestamp: new Date(),
       };
 
@@ -119,7 +128,7 @@ export default function ChatPage() {
         ) : (
           <div className="messages-scroll">
             {messages.map((message) => (
-              <MessageBubble key={message.id} message={message} />
+              <MessageBubble key={message.id} message={message} onCitationClick={setActiveCitation} onShowTrace={setTraceQueryId} />
             ))}
 
             {isTyping && (
@@ -165,13 +174,23 @@ export default function ChatPage() {
           </button>
         </div>
 
+        <QueryParamsPanel compact className="px-1" />
+
         <p className="input-hint">Enter to send • Shift+Enter for a new line</p>
       </div>
+
+      {activeCitation && (
+        <CitationModal citation={activeCitation} onClose={closeCitation} />
+      )}
+
+      {traceQueryId && (
+        <ReasoningTraceModal queryId={traceQueryId} onClose={() => setTraceQueryId(null)} />
+      )}
     </div>
   );
 }
 
-function MessageBubble({ message }: { message: ChatMessage }) {
+function MessageBubble({ message, onCitationClick, onShowTrace }: { message: ChatMessage; onCitationClick: (c: Citation) => void; onShowTrace: (queryId: string) => void }) {
   const isUser = message.role === 'user';
 
   return (
@@ -202,7 +221,11 @@ function MessageBubble({ message }: { message: ChatMessage }) {
         {message.citations && message.citations.length > 0 && (
           <div className="citation-row">
             {message.citations.map((citation, i) => (
-              <span key={citation.reference_id} className="citation-pill" title={citation.content}>
+              <span
+                key={citation.reference_id}
+                className="citation-pill"
+                onClick={() => onCitationClick(citation)}
+              >
                 <FileText className="icon" />
                 <span>{citation.source || `Source ${i + 1}`}</span>
               </span>
@@ -210,9 +233,56 @@ function MessageBubble({ message }: { message: ChatMessage }) {
           </div>
         )}
 
-        <span className="timestamp">
-          {message.timestamp.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}
-        </span>
+        <div className="flex items-center gap-2">
+          <span className="timestamp">
+            {message.timestamp.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}
+          </span>
+          {!isUser && message.queryId && (
+            <button
+              className="reasoning-trace-btn"
+              onClick={() => onShowTrace(message.queryId!)}
+            >
+              <Brain className="icon" />
+              Show reasoning trace
+            </button>
+          )}
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function CitationModal({ citation, onClose }: { citation: Citation; onClose: () => void }) {
+  useEffect(() => {
+    const handleKey = (e: KeyboardEvent) => {
+      if (e.key === 'Escape') onClose();
+    };
+    document.addEventListener('keydown', handleKey);
+    return () => document.removeEventListener('keydown', handleKey);
+  }, [onClose]);
+
+  return (
+    <div className="citation-overlay" onClick={onClose}>
+      <div className="citation-modal" onClick={(e) => e.stopPropagation()}>
+        <div className="citation-modal-header">
+          <div className="citation-modal-title">
+            <FileText className="icon" />
+            <span>{citation.source || 'Source'}</span>
+          </div>
+          <button className="citation-modal-close" onClick={onClose}>
+            <X className="icon" />
+          </button>
+        </div>
+        <div className="citation-modal-body">
+          {citation.content ? (
+            <p>{citation.content}</p>
+          ) : (
+            <p className="text-[hsl(var(--muted-foreground))] italic">No content available</p>
+          )}
+          {citation.file_path && (
+            <span className="citation-modal-path">{citation.file_path}</span>
+          )}
+        </div>
       </div>
     </div>
   );

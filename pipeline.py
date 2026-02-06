@@ -13,6 +13,7 @@ import json
 import os
 import sys
 import uuid
+from urllib.parse import urlparse
 from contextlib import asynccontextmanager
 from typing import Any
 
@@ -21,6 +22,7 @@ import httpx
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
+from torchgen import local
 
 # Import agents
 from query_rewriter import QueryRewriterAgent
@@ -29,6 +31,21 @@ from deducer_model import DeducerAgent
 from judge import JudgeAgent
 from respone_agent import ResponseAgent
 from observation import Observation
+import logging
+from psycopg2.pool import SimpleConnectionPool
+from psycopg2 import sql
+
+
+logger = logging.getLogger(__name__)
+
+POSTGRES_POOL_MIN = int(os.getenv("POSTGRES_POOL_MIN", "1"))
+POSTGRES_POOL_MAX = int(os.getenv("POSTGRES_POOL_MAX", "5"))
+POSTGRES_DB = os.getenv("POSTGRES_DB", "lightrag")
+POSTGRES_USER = os.getenv("POSTGRES_USER", "postgres")
+POSTGRES_PASSWORD = os.getenv("POSTGRES_PASSWORD", "password")
+POSTGRES_HOST = os.getenv("POSTGRES_HOST", "localhost")
+POSTGRES_PORT = os.getenv("POSTGRES_PORT", "5432")
+POSTGRES_SSLMODE = os.getenv("POSTGRES_SSLMODE", "prefer")
 
 # Configuration from environment
 WORKING_DIR = os.getenv("LIGHTRAG_WORKING_DIR", "./rag_storage")
@@ -41,9 +58,8 @@ ZAI_API_KEY = os.getenv("ZAI_API_KEY", "")
 ZAI_MODEL = os.getenv("ZAI_MODEL", "glm-4.7-flash")
 
 # LightRAG Service Configuration (container)
-LIGHTRAG_HOST = os.getenv("LIGHTRAG_HOST", "http://localhost")
+LIGHTRAG_HOST = os.getenv("LIGHTRAG_HOST", "localhost")
 LIGHTRAG_PORT = os.getenv("LIGHTRAG_PORT", "8005")
-LIGHTRAG_SERVICE_URL = f"http://{LIGHTRAG_HOST}:{LIGHTRAG_PORT}"
 LIGHTRAG_API_KEY = os.getenv("LIGHTRAG_API_KEY", "")
 
 # LLM Configuration
@@ -61,6 +77,21 @@ MAX_EMBED_TOKENS = int(os.getenv("MAX_EMBED_TOKENS", "32768"))
 MAX_STEPS = int(os.getenv("MAX_STEPS", "5"))
 SIMILARITY_THRESHOLD = float(os.getenv("SIMILARITY_THRESHOLD", "0.75"))
 TOP_K = int(os.getenv("TOP_K", "10"))
+
+
+def build_service_url(host: str, port: str | int) -> str:
+    """Build a service URL without double-schemes or duplicate ports."""
+    host = host.strip().rstrip("/")
+    port_str = str(port)
+    if host.startswith("http://") or host.startswith("https://"):
+        parsed = urlparse(host)
+        if parsed.netloc and ":" in parsed.netloc:
+            return host
+        return f"{host}:{port_str}"
+    return f"http://{host}:{port_str}"
+
+
+LIGHTRAG_SERVICE_URL = build_service_url(LIGHTRAG_HOST, LIGHTRAG_PORT)
 
 # Store for active pipeline jobs
 pipeline_jobs: dict[str, dict[str, Any]] = {}
@@ -90,6 +121,7 @@ async def get_lightrag_client() -> httpx.AsyncClient:
 
 class QueryRequest(BaseModel):
     """Request model for querying."""
+    query_id: str = Field(..., description="Unique ID for the query")
     query: str = Field(..., description="The user query")
     max_steps: int = Field(default=MAX_STEPS, description="Maximum number of iteration steps")
     similarity_threshold: float = Field(default=SIMILARITY_THRESHOLD, description="Convergence threshold")
@@ -122,7 +154,7 @@ class SSEEvent(BaseModel):
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Manage application lifespan - initialize and cleanup resources."""
-    global _http_client
+    global _http_client, db_pool
 
     # Startup
     print("Initializing Pipeline Service...")
@@ -130,7 +162,10 @@ async def lifespan(app: FastAPI):
 
     # Initialize HTTP client for LightRAG service
     await get_lightrag_client()
+    # Initialize Postgres connection pool for document status tracking
+    db_pool = init_db_pool()
     print("Pipeline Service initialized")
+    
 
     yield
 
@@ -139,9 +174,94 @@ async def lifespan(app: FastAPI):
     if _http_client:
         await _http_client.aclose()
         _http_client = None
+    if db_pool:
+        db_pool.closeall()
     print("Pipeline Service cleanup complete.")
 
 
+def init_db_pool() -> SimpleConnectionPool | None:
+    """Initialize Postgres connection pool and ensure documents table exists."""
+    try:
+        pool = SimpleConnectionPool(
+            POSTGRES_POOL_MIN,
+            POSTGRES_POOL_MAX,
+            dbname=POSTGRES_DB,
+            user=POSTGRES_USER,
+            password=POSTGRES_PASSWORD,
+            host=POSTGRES_HOST,
+            port=POSTGRES_PORT,
+            sslmode=POSTGRES_SSLMODE,
+        )
+        ensure_queries_table(pool)
+        logger.info("Initialized Postgres pool for document tracking")
+        return pool
+    except Exception:
+        logger.exception("Failed to initialize Postgres pool; document tracking disabled")
+        return None
+    
+def ensure_queries_table(pool: SimpleConnectionPool) -> None:
+    """Create Queries table if it does not already exist."""
+    if not pool:
+        return
+
+    conn = pool.getconn()
+    try:
+        with conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    CREATE TABLE IF NOT EXISTS queries (
+                        query_id UUID PRIMARY KEY,
+                        query_text TEXT NOT NULL,
+                        query_max_steps INT,
+                        query_similarity_threshold FLOAT,
+                        query_top_k INT,
+                        created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                        updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                        reasoning_trace JSONB
+                    );
+                    """
+                )
+    except Exception:
+        logger.exception("Failed to ensure queries table")
+    finally:
+        pool.putconn(conn)
+
+
+def update_query_reasoning_trace(
+    query_id: str,
+    query_reasoning_trace: dict[str, Any],
+) -> None:
+    """Update the reasoning_trace field for a query record."""
+    if not db_pool:
+        logger.warning("Postgres pool not available; skipping query record")
+        return
+
+    conn = db_pool.getconn()
+    try:
+        with conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    UPDATE queries
+                    SET reasoning_trace = %s,
+                        updated_at = NOW()
+                    WHERE query_id = %s;
+                    """,
+                    (json.dumps(query_reasoning_trace), query_id),
+                )
+                if cur.rowcount == 0:
+                    logger.warning("No query record found for query_id=%s", query_id)
+                else:
+                    logger.info(
+                        "Query reasoning_trace updated: id=%s (%s)",
+                        query_id,
+                        cur.statusmessage,
+                    )
+    except Exception:
+        logger.exception("Failed to update query record for %s", query_id)
+    finally:
+        db_pool.putconn(conn)
 # ============================================================================
 # FastAPI Application
 # ============================================================================
@@ -207,6 +327,7 @@ def format_sse(event: str, data: dict[str, Any]) -> str:
 async def run_pipeline_with_sse(
     job_id: str,
     query: str,
+    query_id: str,
     max_steps: int,
     similarity_threshold: float,
     top_k: int,
@@ -225,10 +346,14 @@ async def run_pipeline_with_sse(
     - completed: Pipeline completed
     - error: Error occurred
     """
+    assert query_id is not None, "query_id must be provided for tracking"
     try:
+        query_logs = {}
+        update_query_reasoning_trace(query_id=query_id, query_reasoning_trace={"status": "started"})
         # Update job status
         pipeline_jobs[job_id] = {"status": "running", "progress": 0}
 
+        logger.info(f"Job {job_id} started with query: {query_id}")
         # Emit start event
         yield format_sse("started", {
             "job_id": job_id,
@@ -246,25 +371,26 @@ async def run_pipeline_with_sse(
         response_agent = agents["response"]
 
 
-        # Step 1 & 2: Decompose query
-        yield format_sse("progress", {
-            "job_id": job_id,
-            "stage": "decomposition",
-            "message": "Decomposing query into subqueries..."
-        })
+        # We no longer perform query decomposition in the initial step.
+        # # Step 1 & 2: Decompose query
+        # yield format_sse("progress", {
+        #     "job_id": job_id,
+        #     "stage": "decomposition",
+        #     "message": "Decomposing query into subqueries..."
+        # })
 
-        # decomposition = await query_rewriter._decompose_query(query)
-        # subqueries = [sq.canonical_form for sq in decomposition.subqueries]
+        # # decomposition = await query_rewriter._decompose_query(query)
+        # # subqueries = [sq.canonical_form for sq in decomposition.subqueries]
         subqueries = None
         if not subqueries:
             subqueries = [query]
 
-        yield format_sse("decomposition", {
-            "job_id": job_id,
-            "subqueries": subqueries,
-            "count": len(subqueries),
-            "message": f"Query decomposed into {len(subqueries)} subqueries"
-        })
+        # yield format_sse("decomposition", {
+        #     "job_id": job_id,
+        #     "subqueries": subqueries,
+        #     "count": len(subqueries),
+        #     "message": f"Query decomposed into {len(subqueries)} subqueries"
+        # })
 
         # Initialize observation
         observation = Observation(
@@ -285,7 +411,13 @@ async def run_pipeline_with_sse(
 
         retriever_result: RetrieverResult = await retriever.act(observation)
         context_string = retriever.get_context_as_string(retriever_result)
+        local_step = 1
+        query_logs[f'{local_step}'] = {}
+
+        query_logs[f'{local_step}']['first_retrieval_context'] = [ctx.to_dict() for ctx in retriever_result.contexts]
+        local_step += 1
         observation.retrieved_context = [ctx.to_dict() for ctx in retriever_result.contexts]
+        logger.info(f"Job {job_id} retrieved {len(retriever_result.contexts)} context items in initial retrieval")
 
         yield format_sse("retrieval", {
             "job_id": job_id,
@@ -314,7 +446,14 @@ async def run_pipeline_with_sse(
             deduction_result = await deducer.deduce(context_string)
             inferred_answer = deduction_result["inferred_answer"]
             inferred_query = deduction_result["inferred_query"]
+            query_logs[f'{local_step}'] = {}
 
+            query_logs[f'{local_step}'][f"deduction_step_{current_step}"] = {
+                "inferred_answer": inferred_answer,
+                "inferred_query": inferred_query,
+            }
+            local_step += 1
+            logger.info(f"Job {job_id} deduction result: {query_logs[f'{local_step - 1}'][f'deduction_step_{current_step}']}")
             observation.inferred_answer = inferred_answer.get("answer", "")
             observation.inferred_query = inferred_query.get("query", "")
 
@@ -345,6 +484,18 @@ async def run_pipeline_with_sse(
 
             observation.similarity_score = judgement.similarity_score
             observation.converged = judgement.converged
+
+            query_logs[f'{local_step}'] = {}
+            query_logs[f'{local_step}'][f"judgement_step_{current_step}"] = {
+                "similarity_score": judgement.similarity_score,
+                "converged": judgement.converged,
+                "new_subqueries": [sq.canonical_form for sq in judgement.new_subqueries.subqueries] if judgement.new_subqueries else [],
+                "missing_context": judgement.missing_context,
+            }
+            local_step += 1
+
+            logger.info(f"Job {job_id} judgement result: {query_logs[f'{local_step - 1}'][f'judgement_step_{current_step}']}")
+
 
             yield format_sse("judgement", {
                 "job_id": job_id,
@@ -384,6 +535,13 @@ async def run_pipeline_with_sse(
                     retriever_result = await retriever.act(observation)
                     context_string = retriever.get_context_as_string(retriever_result)
                     observation.retrieved_context = [ctx.to_dict() for ctx in retriever_result.contexts]
+                    query_logs[f'{local_step}'] = {}
+                    query_logs[f'{local_step}'][f"retrieval_step_{current_step + 1}"] = {
+                        "fused_context": [ctx.to_dict() for ctx in retriever_result.contexts]
+                    }
+                    local_step += 1
+
+                    logger.info(f"Job {job_id} retrieved {len(retriever_result.contexts)} context items in retrieval step {current_step + 1}")
 
                     yield format_sse("retrieval", {
                         "job_id": job_id,
@@ -417,6 +575,11 @@ async def run_pipeline_with_sse(
             "rrf_scores": retriever_result.rrf_scores,
         }
 
+        logger.info(f"Job {job_id} response observation: {response_observation}")
+        query_logs[f'{local_step}'] = {}
+        query_logs[f'{local_step}']["final_response_observation"] = response_observation
+        local_step += 1
+
         response_result = await response_agent.act(response_observation)
 
         # Build final result
@@ -435,7 +598,11 @@ async def run_pipeline_with_sse(
                 "limitations": response_result.get("limitations", []),
             }
         }
-        print(result)
+        logger.info(f"Job {job_id} final result: {result}")
+        query_logs[f'{local_step}'] = {}
+        query_logs[f'{local_step}']["final_result"] = result
+        local_step += 1
+
 
         # Update job status
         pipeline_jobs[job_id] = {"status": "completed", "progress": 100, "result": result}
@@ -450,14 +617,26 @@ async def run_pipeline_with_sse(
     except Exception as e:
         import traceback
         error_trace = traceback.format_exc()
-        pipeline_jobs[job_id] = {"status": "error", "error": str(e)}
+        pipeline_jobs[job_id] = {"status": "error", "error": str(e), "traceback": error_trace}
 
+        query_logs[f'{local_step}'] = {}
+        query_logs[f'{local_step}']["error"] = {
+            "error_message": str(e),
+            "traceback": error_trace,
+        }
+        local_step += 1
+        logger.error(f"Job {job_id} failed with error: {str(e)}\n{error_trace}")
         yield format_sse("error", {
             "job_id": job_id,
             "error": str(e),
             "traceback": error_trace,
             "message": f"Pipeline failed: {str(e)}"
         })
+    finally:
+        # store the query log in postgres
+        update_query_reasoning_trace(query_id=query_id, query_reasoning_trace=query_logs)
+        logger.info(f"Job {job_id} query log stored in database")
+
 
 
 # ============================================================================
@@ -510,6 +689,7 @@ async def query_with_sse(request: QueryRequest):
     return StreamingResponse(
         run_pipeline_with_sse(
             job_id=job_id,
+            query_id=request.query_id,
             query=request.query,
             max_steps=request.max_steps,
             similarity_threshold=request.similarity_threshold,

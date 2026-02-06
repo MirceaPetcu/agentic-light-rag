@@ -12,6 +12,7 @@ import sys
 import traceback
 import logging
 import uuid
+from urllib.parse import urlparse
 from contextlib import asynccontextmanager
 from datetime import datetime
 from typing import Any
@@ -30,19 +31,33 @@ from lightrag import QueryParam
 
 # Configuration from environment
 # Pipeline Service Configuration
-PIPELINE_HOST = os.getenv("PIPELINE_HOST", "http://localhost")
+PIPELINE_HOST = os.getenv("PIPELINE_HOST", "localhost")
 PIPELINE_PORT = os.getenv("PIPELINE_PORT", "8003")
-PIPELINE_SERVICE_URL = f"http://{PIPELINE_HOST}:{PIPELINE_PORT}"
 
 # LightRAG FastAPI Service Configuration
-LIGHTRAG_HOST = os.getenv("LIGHTRAG_HOST", "http://localhost")
+LIGHTRAG_HOST = os.getenv("LIGHTRAG_HOST", "localhost")
 LIGHTRAG_PORT = os.getenv("LIGHTRAG_PORT", "8005")
-LIGHTRAG_SERVICE_URL = f"http://{LIGHTRAG_HOST}:{LIGHTRAG_PORT}"
 
 # Multi-agent configuration (defaults for query requests)
 MAX_STEPS = int(os.getenv("MAX_STEPS", "5"))
 SIMILARITY_THRESHOLD = float(os.getenv("SIMILARITY_THRESHOLD", "0.75"))
 TOP_K = int(os.getenv("TOP_K", "10"))
+
+
+def build_service_url(host: str, port: str | int) -> str:
+    """Build a service URL without double-schemes or duplicate ports."""
+    host = host.strip().rstrip("/")
+    port_str = str(port)
+    if host.startswith("http://") or host.startswith("https://"):
+        parsed = urlparse(host)
+        if parsed.netloc and ":" in parsed.netloc:
+            return host
+        return f"{host}:{port_str}"
+    return f"http://{host}:{port_str}"
+
+
+PIPELINE_SERVICE_URL = build_service_url(PIPELINE_HOST, PIPELINE_PORT)
+LIGHTRAG_SERVICE_URL = build_service_url(LIGHTRAG_HOST, LIGHTRAG_PORT)
 
 # Postgres configuration
 POSTGRES_HOST = os.getenv("POSTGRES_HOST", "localhost")
@@ -56,7 +71,6 @@ POSTGRES_POOL_MAX = int(os.getenv("POSTGRES_POOL_MAX", "5"))
 
 # Global instances
 http_client: httpx.AsyncClient | None = None
-http_sync_client: httpx.Client | None = None
 db_pool: SimpleConnectionPool | None = None
 
 # Configure logging
@@ -143,14 +157,13 @@ class HealthResponse(BaseModel):
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Manage application lifespan - initialize and cleanup resources."""
-    global http_client, http_sync_client, db_pool
+    global http_client, db_pool
 
     # Startup
     print("Initializing app...")
 
     # Initialize HTTP clients for communicating with LightRAG and Pipeline services
     http_client = httpx.AsyncClient(timeout=httpx.Timeout(600.0, connect=10.0))
-    http_sync_client = httpx.Client(timeout=httpx.Timeout(600.0, connect=10.0))
     print(f"LightRAG service URL: {LIGHTRAG_SERVICE_URL}")
     print(f"Pipeline service URL: {PIPELINE_SERVICE_URL}")
 
@@ -163,8 +176,6 @@ async def lifespan(app: FastAPI):
     print("Shutting down...")
     if http_client:
         await http_client.aclose()
-    if http_sync_client:
-        http_sync_client.close()
     if db_pool:
         db_pool.closeall()
     print("Cleanup complete.")
@@ -278,6 +289,7 @@ def init_db_pool() -> SimpleConnectionPool | None:
             sslmode=POSTGRES_SSLMODE,
         )
         ensure_documents_table(pool)
+        ensure_queries_table(pool)
         logger.info("Initialized Postgres pool for document tracking")
         return pool
     except Exception:
@@ -309,6 +321,75 @@ def ensure_documents_table(pool: SimpleConnectionPool) -> None:
         logger.exception("Failed to ensure documents table")
     finally:
         pool.putconn(conn)
+
+def ensure_queries_table(pool: SimpleConnectionPool) -> None:
+    """Create Queries table if it does not already exist."""
+    if not pool:
+        return
+
+    conn = pool.getconn()
+    try:
+        with conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    CREATE TABLE IF NOT EXISTS queries (
+                        query_id UUID PRIMARY KEY,
+                        query_text TEXT NOT NULL,
+                        query_max_steps INT,
+                        query_similarity_threshold FLOAT,
+                        query_top_k INT,
+                        created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                        updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                        reasoning_trace JSONB
+                    );
+                    """
+                )
+    except Exception:
+        logger.exception("Failed to ensure queries table")
+    finally:
+        pool.putconn(conn)
+
+
+def record_query(
+    query_id: str,
+    query_text: str,
+    query_max_steps: int = MAX_STEPS,
+    query_similarity_threshold: float = SIMILARITY_THRESHOLD,
+    query_top_k: int = TOP_K,
+) -> None:
+    """Insert or update a query record in the Queries table."""
+    if not db_pool:
+        logger.warning("Postgres pool not available; skipping query record")
+        return
+
+    conn = db_pool.getconn()
+    try:
+        with conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    INSERT INTO queries (query_id, query_text, query_max_steps, query_similarity_threshold, query_top_k)
+                    VALUES (%s, %s, %s, %s, %s)
+                    ON CONFLICT (query_id) DO UPDATE SET
+                        query_text = EXCLUDED.query_text,
+                        query_max_steps = EXCLUDED.query_max_steps,
+                        query_similarity_threshold = EXCLUDED.query_similarity_threshold,
+                        query_top_k = EXCLUDED.query_top_k,
+                        updated_at = NOW();
+                    """,
+                    (query_id, query_text, query_max_steps, query_similarity_threshold, query_top_k),
+                )
+                logger.info(
+                    "Query record upsert succeeded: id=%s text=%s (%s)",
+                    query_id,
+                    query_text,
+                    cur.statusmessage,
+                )
+    except Exception:
+        logger.exception("Failed to upsert query record for %s", query_id)
+    finally:
+        db_pool.putconn(conn)
 
 
 def record_document_status(
@@ -463,7 +544,7 @@ async def stream_pipeline_sse(query_request: QueryRequest):
         yield f"event: error\ndata: {{\"error\": \"Stream error: {str(e)}\"}}\n\n"
 
 
-async def call_pipeline_service(query_request: QueryRequest) -> dict[str, Any]:
+async def call_pipeline_service(query_request: QueryRequest, query_id: str) -> dict[str, Any]:
     """
     Call the pipeline service and wait for the final result.
 
@@ -481,6 +562,7 @@ async def call_pipeline_service(query_request: QueryRequest) -> dict[str, Any]:
             "POST",
             f"{PIPELINE_SERVICE_URL}/query",
             json={
+                "query_id": query_id,
                 "query": query_request.query,
                 "max_steps": query_request.max_steps,
                 "similarity_threshold": query_request.similarity_threshold,
@@ -489,10 +571,11 @@ async def call_pipeline_service(query_request: QueryRequest) -> dict[str, Any]:
             headers={"Accept": "text/event-stream"},
         ) as response:
             if response.status_code != 200:
-                error_text = await response.aread()
+                error_text = (await response.aread()).decode().strip()
+                detail = error_text or "Pipeline service returned an empty error response"
                 raise HTTPException(
                     status_code=response.status_code,
-                    detail=f"Pipeline service error: {error_text.decode()}"
+                    detail=f"Pipeline service error: {detail}"
                 )
 
             # Parse SSE events and extract the final result
@@ -513,9 +596,10 @@ async def call_pipeline_service(query_request: QueryRequest) -> dict[str, Any]:
                             if current_event == "completed":
                                 final_result = data.get("result", {})
                             elif current_event == "error":
+                                error_detail = data.get("error") or data.get("message") or "Unknown pipeline error"
                                 raise HTTPException(
                                     status_code=500,
-                                    detail=data.get("error", "Unknown pipeline error")
+                                    detail=error_detail
                                 )
                         except json.JSONDecodeError:
                             pass
@@ -542,6 +626,41 @@ async def call_pipeline_service(query_request: QueryRequest) -> dict[str, Any]:
         raise HTTPException(status_code=500, detail="No result received from pipeline service")
 
     return final_result
+
+
+async def call_lightrag_service(query_request: QueryRequest) -> dict[str, Any]:
+    """Call the LightRAG service directly for a non-streaming response."""
+    if not http_client:
+        raise HTTPException(status_code=503, detail="HTTP client not initialized")
+
+    if not await check_lightrag_service_health():
+        raise HTTPException(
+            status_code=503,
+            detail=f"LightRAG service not available at {LIGHTRAG_SERVICE_URL}"
+        )
+
+    response = await http_client.post(
+        f"{LIGHTRAG_SERVICE_URL}/query",
+        json={
+            "query": query_request.query,
+            "mode": "mix",
+            "top_k": query_request.top_k,
+        },
+    )
+    response.raise_for_status()
+    result = response.json()
+
+    return {
+        "status": "success",
+        "response": result.get("response", ""),
+        "citations": result.get("references", []),
+        "confidence": 0.0,
+        "steps_taken": 1,
+        "converged": False,
+        "metadata": {
+            "fallback": "lightrag",
+        },
+    }
 
 
 # ============================================================================
@@ -572,7 +691,7 @@ async def ingest_document(request: IngestRequest):
     3. Build the knowledge graph
     4. Store embeddings for retrieval
     """
-    if not http_sync_client:
+    if not http_client:
         raise HTTPException(status_code=503, detail="HTTP client not initialized")
 
     document_id = request.doc_id or str(uuid.uuid4())
@@ -586,8 +705,8 @@ async def ingest_document(request: IngestRequest):
         if request.file_path:
             ingest_request["file_path"] = request.file_path
 
-        # Call LightRAG service /ingest endpoint using sync client
-        response = http_sync_client.post(
+        # Call LightRAG service /ingest endpoint using async client
+        response = await http_client.post(
             f"{LIGHTRAG_SERVICE_URL}/ingest",
             json=ingest_request,
         )
@@ -632,7 +751,7 @@ async def ingest_file(
 
     Supports text files (.txt, .md, .json, etc.)
     """
-    if not http_sync_client:
+    if not http_client:
         raise HTTPException(status_code=503, detail="HTTP client not initialized")
 
     document_id = doc_id or str(uuid.uuid4())
@@ -672,8 +791,8 @@ async def ingest_file(
             if file.filename:
                 ingest_request["file_path"] = file.filename
 
-            # Call LightRAG service /ingest endpoint using sync client
-            response = http_sync_client.post(
+            # Call LightRAG service /ingest endpoint using async client
+            response = await http_client.post(
                 f"{LIGHTRAG_SERVICE_URL}/ingest",
                 json=ingest_request,
             )
@@ -739,6 +858,10 @@ async def query(request: QueryRequest):
     """
     if not request.query.strip():
         raise HTTPException(status_code=400, detail="Query cannot be empty")
+    
+    # Record the query in the database for tracking
+    query_id = str(uuid.uuid4())
+    record_query(query_id, request.query, request.max_steps, request.similarity_threshold, request.top_k)
 
     # Check if pipeline service is available
     if not await check_pipeline_service_health():
@@ -746,21 +869,10 @@ async def query(request: QueryRequest):
             status_code=503,
             detail=f"Pipeline service not available at {PIPELINE_SERVICE_URL}"
         )
-
-    if request.stream:
-        # Return SSE stream
-        return StreamingResponse(
-            stream_pipeline_sse(request),
-            media_type="text/event-stream",
-            headers={
-                "Cache-Control": "no-cache",
-                "Connection": "keep-alive",
-            }
-        )
-    else:
-        # Wait for final result and return it
-        result = await call_pipeline_service(request)
-        return QueryResponse(**result)
+    # Wait for final result and return it
+    result = await call_pipeline_service(request, query_id=query_id)
+    result.setdefault("metadata", {})["query_id"] = query_id
+    return QueryResponse(**result)
 
 
 @app.post("/query/simple")
@@ -856,6 +968,37 @@ async def get_document_statuses(request: DocumentStatusRequest):
     return DocumentStatusResponse(documents=documents)
 
 
+@app.get("/reasoning_trace/{query_id}")
+async def get_reasoning_trace(query_id: str):
+    """Fetch the reasoning trace for a given query ID."""
+    if not db_pool:
+        raise HTTPException(status_code=503, detail="Database connection not initialized")
+
+    conn = db_pool.getconn()
+    try:
+        with conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    SELECT reasoning_trace
+                    FROM queries
+                    WHERE query_id = %s;
+                    """,
+                    (query_id,),
+                )
+                row = cur.fetchone()
+
+        if row and row[0]:
+            return {"query_id": query_id, "reasoning_trace": row[0]}
+        else:
+            raise HTTPException(status_code=404, detail="Reasoning trace not found for query_id: " + query_id)
+    except HTTPException:
+        raise
+    except Exception:
+        logger.exception("Failed to fetch reasoning trace for query_id: %s", query_id)
+        raise HTTPException(status_code=500, detail="Failed to fetch reasoning trace")
+    finally:
+        db_pool.putconn(conn)
 # ============================================================================
 # Main Entry Point
 # ============================================================================

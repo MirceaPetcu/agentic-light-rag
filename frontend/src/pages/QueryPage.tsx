@@ -1,7 +1,10 @@
 import { useState } from 'react';
-import { ArrowRight, Loader2, ChevronDown } from 'lucide-react';
+import { ArrowRight, Loader2, ChevronDown, Brain } from 'lucide-react';
 import { api } from '../services/api';
 import type { QueryResponse, SimpleQueryResponse } from '../types';
+import { useQueryParams } from '../contexts/QueryParamsContext';
+import QueryParamsPanel from '../components/QueryParamsPanel';
+import ReasoningTraceModal from '../components/ReasoningTraceModal';
 
 type QueryMode = 'advanced' | 'simple';
 
@@ -14,6 +17,8 @@ export default function QueryPage() {
   const [simpleResponse, setSimpleResponse] = useState<SimpleQueryResponse | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [showCitations, setShowCitations] = useState(false);
+  const [traceQueryId, setTraceQueryId] = useState<string | null>(null);
+  const { params } = useQueryParams();
 
   const handleSubmit = async () => {
     if (!query.trim()) return;
@@ -25,7 +30,7 @@ export default function QueryPage() {
 
     try {
       if (queryMode === 'advanced') {
-        const response = await api.query.advanced({ query });
+        const response = await api.query.advanced({ query, ...params });
         setAdvancedResponse(response);
       } else {
         const response = await api.query.simple({ query, mode: simpleMode });
@@ -78,6 +83,10 @@ export default function QueryPage() {
             Direct
           </button>
         </div>
+
+        {queryMode === 'advanced' && (
+          <QueryParamsPanel />
+        )}
 
         {queryMode === 'simple' && (
           <div className="flex gap-2">
@@ -169,6 +178,15 @@ export default function QueryPage() {
             </span>
             <span>{advancedResponse.steps_taken} steps</span>
             <span>{Math.round(advancedResponse.confidence * 100)}% confidence</span>
+            {advancedResponse.metadata?.query_id && (
+              <button
+                className="reasoning-trace-btn"
+                onClick={() => setTraceQueryId(advancedResponse.metadata.query_id!)}
+              >
+                <Brain className="icon" />
+                Show reasoning trace
+              </button>
+            )}
           </div>
 
           <div className="text-[hsl(var(--foreground))] leading-relaxed whitespace-pre-wrap">
@@ -243,6 +261,10 @@ export default function QueryPage() {
             {simpleResponse.response}
           </div>
         </div>
+      )}
+
+      {traceQueryId && (
+        <ReasoningTraceModal queryId={traceQueryId} onClose={() => setTraceQueryId(null)} />
       )}
     </div>
   );

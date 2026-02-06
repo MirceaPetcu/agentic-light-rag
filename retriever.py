@@ -262,7 +262,7 @@ class RetrieverAgent(BaseAgent):
             step=1,
         )
         
-        # Store in Redis
+        # Store in memory
         self._store_in_memory(original_query, result)
         
         return result
@@ -362,7 +362,7 @@ class RetrieverAgent(BaseAgent):
             step=step,
         )
 
-        # Step 8: Store updated result in Redis
+        # Step 8: Store updated result in memory
         self._store_in_memory(original_query, result)
 
         return result
