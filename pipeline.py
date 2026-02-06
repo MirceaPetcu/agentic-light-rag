@@ -73,6 +73,9 @@ EMBEDDING_HOST = os.getenv("EMBEDDING_BINDING_HOST", "http://localhost:11434")
 EMBEDDING_DIM = int(os.getenv("EMBEDDING_DIM", "1024"))
 MAX_EMBED_TOKENS = int(os.getenv("MAX_EMBED_TOKENS", "32768"))
 
+# ColBERT Service Configuration
+COLBERT_SERVICE_URL = os.getenv("COLBERT_SERVICE_URL", "http://localhost:8002")
+
 # Multi-agent configuration
 MAX_STEPS = int(os.getenv("MAX_STEPS", "5"))
 SIMILARITY_THRESHOLD = float(os.getenv("SIMILARITY_THRESHOLD", "0.75"))
@@ -296,6 +299,7 @@ def create_agents(
             lightrag_api_key=LIGHTRAG_API_KEY,
             top_k=top_k,
             query_mode="mix",
+            colbert_base_url=COLBERT_SERVICE_URL,
         ),
         "deducer": DeducerAgent(
             name="deducer",
@@ -309,6 +313,7 @@ def create_agents(
             api_key=VLLM_API_KEY,
             model=VLLM_MODEL,
             similarity_threshold=similarity_threshold,
+            colbert_base_url=COLBERT_SERVICE_URL,
         ),
         "response": ResponseAgent(
             name="response",
@@ -490,7 +495,7 @@ async def run_pipeline_with_sse(
                 "similarity_score": judgement.similarity_score,
                 "converged": judgement.converged,
                 "new_subqueries": [sq.canonical_form for sq in judgement.new_subqueries.subqueries] if judgement.new_subqueries else [],
-                "missing_context": judgement.missing_context,
+                "missing_context": judgement.missing_context.model_dump_json() if judgement.missing_context else None,
             }
             local_step += 1
 
