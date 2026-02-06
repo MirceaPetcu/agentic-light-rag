@@ -1,7 +1,6 @@
 export interface HealthStatus {
   status: string;
   rag_initialized: boolean;
-  redis_connected: boolean;
 }
 
 export interface IngestRequest {
@@ -29,6 +28,7 @@ export interface QueryRequest {
   max_steps?: number;
   similarity_threshold?: number;
   top_k?: number;
+  stream?: boolean;
 }
 
 export interface Citation {
@@ -44,6 +44,7 @@ export interface QueryMetadata {
   subqueries_used: string[];
   key_points: string[];
   limitations: string[];
+  query_id?: string;
 }
 
 export interface QueryResponse {
@@ -65,4 +66,51 @@ export interface SimpleQueryResponse {
   status: string;
   response: string;
   mode: string;
+}
+
+export type IngestionStatus =
+  | 'uploading'
+  | 'uploaded'
+  | 'processing'
+  | 'completed'
+  | 'failed'
+  | 'unknown';
+
+export interface ChatAttachment {
+  id: string;
+  name: string;
+  size: number;
+  type: string;
+  docId?: string;
+  trackId?: string;
+  filePath?: string;
+  file?: File;
+  ingestionStatus: IngestionStatus;
+}
+
+export interface ChatMessage {
+  id: string;
+  role: 'user' | 'assistant';
+  content: string;
+  attachments?: ChatAttachment[];
+  timestamp: Date;
+  isLoading?: boolean;
+  citations?: Citation[];
+  queryId?: string;
+}
+
+export interface ReasoningTraceResponse {
+  query_id: string;
+  reasoning_trace: Record<string, unknown>;
+}
+
+export interface DocumentStatus {
+  document_id: string;
+  document_status: string;
+  file_path?: string | null;
+  updated_at?: string;
+}
+
+export interface DocumentStatusResponse {
+  documents: DocumentStatus[];
 }

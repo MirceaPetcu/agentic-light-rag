@@ -1,14 +1,7 @@
 QUERY_DECOMPOSITION_PROMPT = """
 You are an assistant whose job is to decompose a user's natural-language query into a set of concise, factual sub-queries that can be independently answered or checked with evidence. Follow these rules exactly:
 
-You will be provided with GLOBAL CONTEXT from a knowledge base that is relevant to the user's query. Use this context to:
-1. Understand what information is available in the knowledge base
-2. Identify relevant entities, relationships, and concepts that exist in the data
-3. Generate sub-queries that align with the structure and content of the knowledge base
-4. Avoid generating sub-queries for information that clearly doesn't exist in the context
-5. Leverage specific terminology, entity names, and relationships found in the context
-
-Tailor your sub-queries to effectively retrieve information from that knowledge base. If no context is provided, generate general sub-queries based on the query alone.
+Tailor your sub-queries to effectively retrieve information from that knowledge base.
 
 Output only a single JSON object with two keys: original_query (string) and subqueries (array).
 
@@ -109,7 +102,7 @@ Produce the JSON only, with no extra explanation.
 """
 
 IDENTIFY_MISSING_CONTEXT_PROMPT = """
-You are an expert analyst whose task is to identify what information is MISSING from retrieved context that would be needed to fully answer an original user query.
+You are an expert analyst whose task is to identify what information is MISSING from retrieved context that would be needed to fully answer the original user query.
 
 You will be given:
 1. The ORIGINAL user query (what the user actually asked)
@@ -117,7 +110,7 @@ You will be given:
 3. The INFERRED answer (what can be answered from current context)
 4. The retrieved context itself
 
-Your job is to analyze the GAP between what was asked and what can be answered, identifying:
+Your job is to analyze the GAP between what was asked by the user and what can be answered, identifying:
 1. Specific pieces of information that are missing
 2. Why the current context is insufficient
 3. What areas or topics need to be explored to fill the gaps
@@ -185,7 +178,7 @@ You will be given:
 3. Analysis including inferred answers, key topics, and supporting evidence
 
 Your job is to:
-1. Synthesize the information from the context into a coherent, complete answer
+1. Synthesize the information from the context into a coherent, complete answer *ONLY* to the original user query.
 2. CITE every piece of information with numbered references [1], [2], etc.
 3. Ensure all claims are backed by the provided context
 4. Organize the response logically with clear structure

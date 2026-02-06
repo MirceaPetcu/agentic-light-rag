@@ -7,6 +7,8 @@ import type {
   QueryResponse,
   SimpleQueryRequest,
   SimpleQueryResponse,
+  DocumentStatusResponse,
+  ReasoningTraceResponse,
 } from '../types';
 
 const API_BASE = '/api';
@@ -85,6 +87,17 @@ export const api = {
       fetchApi('/query/simple', {
         method: 'POST',
         body: JSON.stringify(data),
+      }),
+
+    reasoningTrace: (queryId: string): Promise<ReasoningTraceResponse> =>
+      fetchApi(`/reasoning_trace/${queryId}`),
+  },
+
+  documents: {
+    status: (documentIds: string[]): Promise<DocumentStatusResponse> =>
+      fetchApi('/documents/status', {
+        method: 'POST',
+        body: JSON.stringify({ document_ids: documentIds }),
       }),
   },
 };
