@@ -114,7 +114,7 @@ services:
     environment:
       - EMBEDDING_MODEL=${EMBEDDING_MODEL:-qwen3-embedding:0.6b}
       - NVIDIA_VISIBLE_DEVICES=""
-      - CUDA_VISIBLE_DEVICES=""app
+      - CUDA_VISIBLE_DEVICES=""
     deploy:
       resources:
         reservations:
@@ -144,7 +144,7 @@ services:
       - ./model_cache:/app/model_cache
     restart: unless-stopped
     healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:8002/health"]
+      test: ["CMD-SHELL", "python -c \"import urllib.request; urllib.request.urlopen('http://localhost:8002/health')\""]
       interval: 30s
       timeout: 10s
       retries: 3
@@ -173,24 +173,32 @@ services:
       # Neo4j
       - NEO4J_URI=bolt://neo4j:7687
       - NEO4J_USERNAME=neo4j
-      - NEO4J_PASSWORD=password
+      - NEO4J_PASSWORD=${NEO4J_PASSWORD:-password}
+      - NEO4J_MAX_CONNECTION_POOL_SIZE=${NEO4J_MAX_CONNECTION_POOL_SIZE:-100}
       # MongoDB
       - MONGO_URI=mongodb://${MONGO_ROOT_USERNAME:-admin}:${MONGO_ROOT_PASSWORD:-password}@mongodb:27017
       - MONGO_DB_NAME=${MONGO_DATABASE:-lightrag}
       - MONGO_PASSWORD=${MONGO_ROOT_PASSWORD:-password}
+      # Postgres
+      - POSTGRES_HOST=postgres
+      - POSTGRES_PORT=5432
+      - POSTGRES_DB=${POSTGRES_DB:-lightrag}
+      - POSTGRES_USER=${POSTGRES_USER:-admin}
+      - POSTGRES_PASSWORD=${POSTGRES_PASSWORD:-password}
       # Storage
       - LIGHTRAG_GRAPH_STORAGE=Neo4JStorage
       - KV_STORAGE=JsonKVStorage
       - VECTOR_STORAGE=NanoVectorDBStorage
-    volumes:
+      - EMBEDDING_TIMEOUT=600
+    volumes:  
       - ./rag_storage:/app/rag_storage
-    # depends_on:
-    #   neo4j:
-    #     condition: service_healthy
-      # vllm:
-      #   condition: service_healthy
-      # ollama:
-      #   condition: service_healthy
+    depends_on:
+      neo4j:
+        condition: service_healthy
+      vllm:
+        condition: service_healthy
+      ollama:
+        condition: service_healthy
     restart: unless-stopped
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
@@ -219,24 +227,37 @@ services:
       - VLLM_BASE_URL=http://vllm:8000/v1
       - VLLM_API_KEY=EMPTY
       - VLLM_MODEL=${VLLM_MODEL:-LiquidAI/LFM2-2.6B}
+      - LLM_BINDING_HOST=http://vllm:8000/v1
+      - LLM_BINDING_API_KEY=EMPTY
+      - LLM_MODEL=${VLLM_MODEL:-LiquidAI/LFM2-2.6B}
       # Embedding (Ollama)
       - EMBEDDING_MODEL=${EMBEDDING_MODEL:-qwen3-embedding:0.6b}
       - EMBEDDING_BINDING_HOST=http://ollama:11434
       - EMBEDDING_DIM=${EMBEDDING_DIM:-1024}
       # ColBERT Service
       - COLBERT_SERVICE_URL=http://colbert:8002
+      # Postgres
+      - POSTGRES_HOST=postgres
+      - POSTGRES_PORT=5432
+      - POSTGRES_DB=${POSTGRES_DB:-lightrag}
+      - POSTGRES_USER=${POSTGRES_USER:-admin}
+      - POSTGRES_PASSWORD=${POSTGRES_PASSWORD:-password}
+      # Multi-agent settings
+      - MAX_STEPS=${MAX_STEPS:-5}
+      - SIMILARITY_THRESHOLD=${SIMILARITY_THRESHOLD:-0.75}
+      - TOP_K=${TOP_K:-10}
     command: ["python", "-m", "uvicorn", "pipeline:app", "--host", "0.0.0.0", "--port", "8003"]
     volumes:
       - ./rag_storage:/app/rag_storage
-    # depends_on:
-    #   lightrag:
-    #     condition: service_healthy
-      # vllm:
-      #   condition: service_healthy
-      # ollama:
-      #   condition: service_healthy
-      # colbert:
-      #   condition: service_healthy
+    depends_on:
+      lightrag:
+        condition: service_healthy
+      vllm:
+        condition: service_healthy
+      ollama:
+        condition: service_healthy
+      colbert:
+        condition: service_healthy
     restart: unless-stopped
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:8003/health"]
@@ -255,9 +276,9 @@ services:
     environment:
       - BACKEND_HOST=${BACKEND_HOST:-app}
       - BACKEND_PORT=${BACKEND_PORT:-8000}
-    # depends_on:
-    #   app:
-    #     condition: service_healthy
+    depends_on:
+      app:
+        condition: service_healthy
     restart: unless-stopped
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:80"]
@@ -282,42 +303,48 @@ services:
       - LIGHTRAG_KV_STORAGE=JsonKVStorage
       - LIGHTRAG_VECTOR_STORAGE=NanoVectorDBStorage
       - LIGHTRAG_HOST=lightrag
-      - LIGHTRAG_PORT=${LIGHTRAG_PORT:-8005}
+      - LIGHTRAG_PORT=8000
       # Neo4j
       - NEO4J_URI=bolt://neo4j:7687
       - NEO4J_USERNAME=neo4j
-      - NEO4J_PASSWORD=password
+      - NEO4J_PASSWORD=${NEO4J_PASSWORD:-password}
       # LLM Configuration (vLLM)
-      - VLLM_BASE_URL=http://vllm:/v1
+      - VLLM_BASE_URL=http://vllm:8000/v1
       - VLLM_API_KEY=EMPTY
       - VLLM_MODEL=${VLLM_MODEL:-LiquidAI/LFM2-2.6B}
       - LLM_BINDING_HOST=http://vllm:8000/v1
       - LLM_BINDING_API_KEY=EMPTY
       - LLM_MODEL=${VLLM_MODEL:-LiquidAI/LFM2-2.6B}
       # Embedding (Ollama)
-      - EMBEDDING_MODEL=${EMBEDDING_MODEL:-nomic-embed-text:latest}
-      - EMBEDDING_BINDING_HOST=http://ollama:11434
-      - EMBEDDING_DIM=${EMBEDDING_DIM:-768}
+      - EMBEDDING_MODEL=${EMBEDDING_MODEL:-qwen3-embedding:0.6b}
+      - EMBEDDING_BINDING_HOST=http://ollama:11435
+      - EMBEDDING_DIM=${EMBEDDING_DIM:-1024}
       # ColBERT Service
       - COLBERT_SERVICE_URL=http://colbert:8002
+      # Postgres
+      - POSTGRES_HOST=postgres
+      - POSTGRES_PORT=5432
+      - POSTGRES_DB=${POSTGRES_DB:-lightrag}
+      - POSTGRES_USER=${POSTGRES_USER:-admin}
+      - POSTGRES_PASSWORD=${POSTGRES_PASSWORD:-password}
       # Multi-agent settings
       - MAX_STEPS=${MAX_STEPS:-5}
       - SIMILARITY_THRESHOLD=${SIMILARITY_THRESHOLD:-0.75}
       - TOP_K=${TOP_K:-10}
       - PIPELINE_HOST=pipeline
-      - PIPELINE_PORT=${PIPELINE_PORT:-8003} # Expose pipeline port for direct access if needed
+      - PIPELINE_PORT=8003
       - PORT=${PORT:-8000}
     volumes:
       - ./rag_storage:/app/rag_storage
-    # depends_on:
-    #   neo4j:
-    #     condition: service_healthy
-      # vllm:
-      #   condition: service_healthy
-      # ollama:
-      #   condition: service_healthy
-      # pipeline:
-      #   condition: service_healthy
+    depends_on:
+      neo4j:
+        condition: service_healthy
+      vllm:
+        condition: service_healthy
+      ollama:
+        condition: service_healthy
+      pipeline:
+        condition: service_healthy
     restart: unless-stopped
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
@@ -325,26 +352,6 @@ services:
       timeout: 10s
       retries: 3
       start_period: 30s
-
-  # # =============================================================================
-  # # Frontend
-  # # =============================================================================
-  # frontend:
-  #   build:
-  #     context: ./frontend
-  #     dockerfile: Dockerfile
-  #   container_name: multiagent-frontend
-  #   ports:
-  #     - "3000:80"
-  #   depends_on:
-  #     - app
-  #   restart: unless-stopped
-  #   healthcheck:
-  #     test: ["CMD", "curl", "-f", "http://localhost:80"]
-  #     interval: 30s
-  #     timeout: 10s
-  #     retries: 3
-
 
 volumes:
   neo4j_data:
