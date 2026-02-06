@@ -1,0 +1,34 @@
+# Frontend Dockerfile (project root)
+# Multi-stage build: build with Node, serve with nginx
+
+FROM node:22-alpine AS builder
+
+WORKDIR /app
+
+# Copy package files and install in the frontend subfolder
+COPY frontend/package.json frontend/package-lock.json* ./frontend/
+WORKDIR /app/frontend
+RUN npm ci --silent
+
+# Copy the rest of the frontend source
+COPY frontend/ ./
+
+# Build the frontend
+RUN npm run build
+
+# Production image
+FROM nginx:alpine
+
+# Copy built assets
+COPY --from=builder /app/frontend/dist /usr/share/nginx/html
+
+# Copy nginx configuration template
+COPY frontend/nginx.conf /etc/nginx/templates/default.conf.template
+
+# Default environment variables for backend connection
+ENV BACKEND_HOST=app
+ENV BACKEND_PORT=8000
+
+EXPOSE 80
+
+CMD ["nginx", "-g", "daemon off;"]

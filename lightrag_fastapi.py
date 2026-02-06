@@ -12,10 +12,11 @@ import json
 from contextlib import asynccontextmanager
 from typing import Any, Dict, List, Literal, Optional
 
-from fastapi import FastAPI, HTTPException, BackgroundTasks
+from fastapi import FastAPI, HTTPException, BackgroundTasks, Request
 from fastapi.responses import StreamingResponse
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field, field_validator
+from psycopg2.pool import SimpleConnectionPool
 
 # Add light_rag to the path for imports
 sys.path.insert(0, './light_rag')
@@ -42,6 +43,16 @@ from functools import partial
 WORKING_DIR = os.getenv("LIGHTRAG_WORKING_DIR", "./rag_storage")
 WORKSPACE = os.getenv("WORKSPACE", "")
 
+# Postgres Configuration (for document status tracking)
+POSTGRES_HOST = os.getenv("POSTGRES_HOST", "localhost")
+POSTGRES_PORT = int(os.getenv("POSTGRES_PORT", "5432"))
+POSTGRES_DB = os.getenv("POSTGRES_DB", "postgres")
+POSTGRES_USER = os.getenv("POSTGRES_USER", "postgres")
+POSTGRES_PASSWORD = os.getenv("POSTGRES_PASSWORD", "postgres")
+POSTGRES_SSLMODE = os.getenv("POSTGRES_SSLMODE", "prefer")
+POSTGRES_POOL_MIN = int(os.getenv("POSTGRES_POOL_MIN", "1"))
+POSTGRES_POOL_MAX = int(os.getenv("POSTGRES_POOL_MAX", "5"))
+
 # LightRAG Storage Configuration
 LIGHTRAG_GRAPH_STORAGE = os.getenv("LIGHTRAG_GRAPH_STORAGE", "NetworkXStorage")
 
@@ -62,8 +73,149 @@ VECTOR_STORAGE = os.getenv("VECTOR_STORAGE", "NanoVectorDBStorage")
 GRAPH_STORAGE = os.getenv("GRAPH_STORAGE", "NetworkXStorage")
 DOC_STATUS_STORAGE = os.getenv("DOC_STATUS_STORAGE", "JsonDocStatusStorage")
 
-# Global LightRAG instance
+# Global LightRAG instance and Postgres pool
 rag: LightRAG | None = None
+db_pool: SimpleConnectionPool | None = None
+
+
+# ============================================================================
+# Postgres Helpers
+# ============================================================================
+
+def init_db_pool() -> SimpleConnectionPool | None:
+    """Initialize Postgres connection pool and ensure Documents table exists."""
+    try:
+        pool = SimpleConnectionPool(
+            POSTGRES_POOL_MIN,
+            POSTGRES_POOL_MAX,
+            dbname=POSTGRES_DB,
+            user=POSTGRES_USER,
+            password=POSTGRES_PASSWORD,
+            host=POSTGRES_HOST,
+            port=POSTGRES_PORT,
+            sslmode=POSTGRES_SSLMODE,
+        )
+        ensure_documents_table(pool)
+        logger.info(
+            "Initialized Postgres pool for document status tracking (host=%s db=%s)",
+            POSTGRES_HOST,
+            POSTGRES_DB,
+        )
+        return pool
+    except Exception:
+        logger.exception(
+            "Failed to initialize Postgres pool; document status tracking disabled"
+        )
+        return None
+
+
+def ensure_documents_table(pool: SimpleConnectionPool) -> None:
+    """Create Documents table if it does not already exist."""
+    if not pool:
+        return
+
+    conn = pool.getconn()
+    try:
+        with conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    CREATE TABLE IF NOT EXISTS documents (
+                        document_id UUID PRIMARY KEY,
+                        document_status TEXT NOT NULL,
+                        file_path TEXT,
+                        created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                        updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+                    );
+                    """
+                )
+    except Exception:
+        logger.exception("Failed to ensure documents table")
+    finally:
+        pool.putconn(conn)
+
+
+def update_document_status(
+    document_id: str | None,
+    status: str,
+    file_path: str | None = None,
+) -> None:
+    """Update a document status using document_id first, falling back to file_path."""
+    if not db_pool:
+        logger.warning(
+            "Postgres pool not available; skip status update status=%s doc_id=%s file_path=%s",
+            status,
+            document_id,
+            file_path,
+        )
+        return
+
+    if not document_id and not file_path:
+        logger.warning(
+            "No document identifier provided; cannot update status to %s", status
+        )
+        return
+
+    conn = db_pool.getconn()
+    try:
+        with conn:
+            with conn.cursor() as cur:
+                updated_rows = 0
+                if document_id:
+                    cur.execute(
+                        """
+                        UPDATE documents
+                        SET document_status = %s,
+                            file_path = COALESCE(%s, file_path),
+                            updated_at = NOW()
+                        WHERE document_id = %s;
+                        """,
+                        (status, file_path, document_id),
+                    )
+                    updated_rows = cur.rowcount
+
+                if updated_rows == 0 and file_path:
+                    cur.execute(
+                        """
+                        UPDATE documents
+                        SET document_status = %s,
+                            updated_at = NOW()
+                        WHERE file_path = %s;
+                        """,
+                        (status, file_path),
+                    )
+                    updated_rows = cur.rowcount
+
+                if updated_rows == 0 and document_id:
+                    cur.execute(
+                        """
+                        INSERT INTO documents (document_id, document_status, file_path)
+                        VALUES (%s, %s, %s)
+                        ON CONFLICT (document_id) DO UPDATE SET
+                            document_status = EXCLUDED.document_status,
+                            file_path = COALESCE(EXCLUDED.file_path, documents.file_path),
+                            updated_at = NOW();
+                        """,
+                        (document_id, status, file_path),
+                    )
+                    updated_rows = cur.rowcount
+
+                logger.info(
+                    "Document status update: status=%s doc_id=%s file_path=%s rows=%s",
+                    status,
+                    document_id,
+                    file_path,
+                    updated_rows,
+                )
+    except Exception:
+        logger.exception(
+            "Failed to update document status to %s for doc_id=%s file_path=%s",
+            status,
+            document_id,
+            file_path,
+        )
+    finally:
+        db_pool.putconn(conn)
 
 
 # ============================================================================
@@ -295,6 +447,10 @@ class IngestDocumentRequest(BaseModel):
         default=None,
         description="Optional file path for citation purposes",
     )
+    document_id: Optional[str] = Field(
+        default=None,
+        description="Optional document identifier used for status tracking",
+    )
     
     @field_validator("text", mode="after")
     @classmethod
@@ -319,6 +475,10 @@ class IngestDocumentsRequest(BaseModel):
     file_paths: Optional[List[str]] = Field(
         default=None,
         description="Optional list of file paths corresponding to each text for citation purposes",
+    )
+    document_ids: Optional[List[str]] = Field(
+        default=None,
+        description="Optional list of document identifiers used for status tracking",
     )
     
     @field_validator("texts", mode="after")
@@ -351,17 +511,19 @@ class IngestResponse(BaseModel):
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Manage LightRAG instance lifecycle."""
-    global rag
+    global rag, db_pool
     
     # Initialize LightRAG
     print("Initializing LightRAG...")
 
     # Ensure working directory exists
     os.makedirs(WORKING_DIR, exist_ok=True)
+    app.state.task_registry = {}
+
+    # Initialize Postgres pool for document tracking
+    db_pool = init_db_pool()
 
     # Initialize LightRAG
-    # Neo4j configuration is automatically read from environment variables:
-    # NEO4J_URI, NEO4J_USERNAME, NEO4J_PASSWORD
     rag = LightRAG(
         working_dir=WORKING_DIR,
         llm_model_func=llm_model_func,
@@ -388,6 +550,8 @@ async def lifespan(app: FastAPI):
     print("Shutting down...")
     if rag:
         await rag.finalize_storages()
+    if db_pool:
+        db_pool.closeall()
     print("Cleanup complete.")
 
 
@@ -419,8 +583,10 @@ app.add_middleware(
 async def pipeline_index_texts(
     rag: LightRAG,
     texts: List[str],
+    fastapi_app: FastAPI,
     file_paths: Optional[List[str]] = None,
     track_id: Optional[str] = None,
+    document_ids: Optional[List[str]] = None,
 ):
     """Index a list of texts with track_id
     
@@ -429,19 +595,69 @@ async def pipeline_index_texts(
         texts: The texts to index
         file_paths: Sources of the texts (optional)
         track_id: Optional tracking ID
+        document_ids: Optional list of document IDs for Postgres updates
     """
+    fastapi_app.state.task_registry[track_id] = "processing"
     if not texts:
+        logger.warning("No texts provided for ingestion (track_id=%s)", track_id)
         return
-    if file_paths is not None:
-        if len(file_paths) != 0 and len(file_paths) != len(texts):
-            # Pad file_paths to match texts length
-            file_paths = list(file_paths)
-            file_paths.extend(["unknown_source"] * (len(texts) - len(file_paths)))
-    
-    await rag.apipeline_enqueue_documents(
-        input=texts, file_paths=file_paths, track_id=track_id
+
+    normalized_file_paths: List[str | None]
+    if file_paths is None:
+        normalized_file_paths = [None] * len(texts)
+    else:
+        normalized_file_paths = list(file_paths)
+        if len(normalized_file_paths) != 0 and len(normalized_file_paths) != len(texts):
+            normalized_file_paths.extend(
+                ["unknown_source"] * (len(texts) - len(normalized_file_paths))
+            )
+
+    normalized_doc_ids: List[str | None]
+    if document_ids is None:
+        normalized_doc_ids = [None] * len(texts)
+    else:
+        normalized_doc_ids = list(document_ids)
+        if len(normalized_doc_ids) < len(texts):
+            normalized_doc_ids.extend([None] * (len(texts) - len(normalized_doc_ids)))
+        elif len(normalized_doc_ids) > len(texts):
+            logger.warning(
+                "Received more document_ids than texts; extra ids will be ignored (track_id=%s)",
+                track_id,
+            )
+            normalized_doc_ids = normalized_doc_ids[: len(texts)]
+
+    # Mark documents as processing in Postgres
+    for doc_id, file_path in zip(normalized_doc_ids, normalized_file_paths):
+        update_document_status(doc_id, "processing", file_path)
+
+    logger.info(
+        "Queued documents for ingestion: track_id=%s count=%s", track_id, len(texts)
     )
-    await rag.apipeline_process_enqueue_documents()
+
+    try:
+        await rag.apipeline_enqueue_documents(
+            input=texts, file_paths=normalized_file_paths, track_id=track_id
+        )
+        await rag.apipeline_process_enqueue_documents()
+        fastapi_app.state.task_registry[track_id] = "ready"
+
+        for doc_id, file_path in zip(normalized_doc_ids, normalized_file_paths):
+            update_document_status(doc_id, "completed", file_path)
+
+        logger.info(
+            "Completed ingestion pipeline: track_id=%s documents=%s",
+            track_id,
+            len(texts),
+        )
+    except Exception:
+        fastapi_app.state.task_registry[track_id] = "failed"
+        for doc_id, file_path in zip(normalized_doc_ids, normalized_file_paths):
+            update_document_status(doc_id, "failed", file_path)
+
+        logger.exception(
+            "Ingestion pipeline failed for track_id=%s", track_id
+        )
+        raise
 
 
 # ============================================================================
@@ -809,6 +1025,7 @@ async def health_check():
 async def ingest_document(
     request: IngestDocumentRequest,
     background_tasks: BackgroundTasks,
+    http_request: Request,
 ):
     """
     Ingest a single document into the RAG system.
@@ -860,8 +1077,10 @@ async def ingest_document(
             pipeline_index_texts,
             rag,
             [request.text],
+            http_request.app,
             file_paths=[request.file_path] if request.file_path else None,
             track_id=track_id,
+            document_ids=[request.document_id] if request.document_id else None,
         )
         
         return IngestResponse(
@@ -930,6 +1149,12 @@ async def ingest_documents(
                     status_code=400,
                     detail="Number of file_paths must match the number of texts",
                 )
+        if request.document_ids is not None:
+            if len(request.document_ids) != len(request.texts):
+                raise HTTPException(
+                    status_code=400,
+                    detail="Number of document_ids must match the number of texts",
+                )
         
         # Check if any file_paths already exist in doc_status storage
         if request.file_paths:
@@ -976,6 +1201,7 @@ async def ingest_documents(
             request.texts,
             file_paths=request.file_paths,
             track_id=track_id,
+            document_ids=request.document_ids,
         )
         
         return IngestResponse(
@@ -1009,6 +1235,10 @@ async def root():
         },
     }
 
+@app.get("/document/status/{track_id}")
+async def get_document_status(track_id: str, request: Request) -> str:
+    """Get the processing status of a document by track_id."""
+    return request.app.state.task_registry.get(track_id, "not_found")
 
 if __name__ == "__main__":
     import uvicorn

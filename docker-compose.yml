@@ -6,8 +6,8 @@ services:
     image: neo4j:latest
     container_name: neo4j-lightrag
     ports:
-      - "7474:7474"  # HTTP Browser
-      - "7687:7687"  # Bolt
+      - "${NEO4J_HTTP_PORT:-7474}:7474"  # HTTP Browser
+      - "${NEO4J_BOLT_PORT:-7687}:7687"  # Bolt
     environment:
       NEO4J_AUTH: neo4j/password
       NEO4J_apoc_export_allow__all__nodes: "true"
@@ -17,11 +17,51 @@ services:
       - neo4j_logs:/logs
     restart: unless-stopped
     healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:7474"]
+      # test: ["CMD", "curl", "-f", "http://localhost:7474"]
+      test: ["CMD-SHELL", "wget -qO- http://localhost:7474 >/dev/null 2>&1"]
       interval: 30s
       timeout: 10s
       retries: 5
       start_period: 30s
+
+  mongodb:
+    image: mongo:latest
+    container_name: mongodb-lightrag
+    ports:
+      - "${MONGODB_PORT:-27017}:27017"  # MongoDB Port
+    environment:
+      MONGO_INITDB_ROOT_USERNAME: ${MONGO_ROOT_USERNAME:-admin}
+      MONGO_INITDB_ROOT_PASSWORD: ${MONGO_ROOT_PASSWORD:-password}
+      MONGO_INITDB_DATABASE: ${MONGO_DATABASE:-lightrag}
+    volumes:
+      - mongodb_data:/data/db
+      - mongodb_config:/data/configdb
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "mongosh", "--eval", "db.adminCommand('ping')"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 30s
+
+  postgres:
+    image: postgres:16
+    container_name: postgres-lightrag
+    ports:
+      - "${POSTGRES_PORT:-5432}:5432"
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-admin}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-password}
+      POSTGRES_DB: ${POSTGRES_DB:-lightrag}
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-admin} -d ${POSTGRES_DB:-lightrag}"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 20s
 
   # =============================================================================
   # LLM Services
@@ -30,7 +70,7 @@ services:
     image: vllm/vllm-openai:latest
     container_name: vllm-server
     ports:
-      - "8001:8000"
+      - "${VLLM_PORT:-8001}:8000"
     environment:
       - NVIDIA_VISIBLE_DEVICES=all
       - HUGGING_FACE_HUB_TOKEN=${HF_TOKEN:-}
@@ -60,7 +100,7 @@ services:
     image: ollama/ollama:latest
     container_name: ollama-lightrag
     ports:
-      - "11435:11434"
+      - "${OLLAMA_PORT:-11435}:11434"
     volumes:
       - ollama_data:/root/.ollama
     entrypoint: ["/bin/sh", "-c"]
@@ -74,7 +114,7 @@ services:
     environment:
       - EMBEDDING_MODEL=${EMBEDDING_MODEL:-qwen3-embedding:0.6b}
       - NVIDIA_VISIBLE_DEVICES=""
-      - CUDA_VISIBLE_DEVICES=""
+      - CUDA_VISIBLE_DEVICES=""app
     deploy:
       resources:
         reservations:
@@ -96,7 +136,7 @@ services:
       dockerfile: Dockerfile.colbert
     container_name: colbert-service
     ports:
-      - "8002:8002"
+      - "${COLBERT_PORT:-8002}:8002"
     environment:
       - COLBERT_MODEL=${COLBERT_MODEL:-colbert-ir/colbertv2.0}
       - COLBERT_DEVICE=${COLBERT_DEVICE:-cpu}
@@ -110,62 +150,181 @@ services:
       retries: 3
       start_period: 60s
 
-
+  # =============================================================================
+  # LightRAG FastAPI Service
+  # =============================================================================
+  lightrag:
+    build:
+      context: .
+      dockerfile: Dockerfile.lightrag_fastapi
+    container_name: lightrag-server
+    ports:
+      - "${LIGHTRAG_PORT:-8005}:8000"
+    environment:
+      - LIGHTRAG_WORKING_DIR=/app/rag_storage
+      # LLM Configuration (vLLM)
+      - LLM_BINDING_HOST=http://vllm:8000/v1
+      - LLM_BINDING_API_KEY=EMPTY
+      - LLM_MODEL=${VLLM_MODEL:-LiquidAI/LFM2-2.6B}
+      # Embedding (Ollama)
+      - EMBEDDING_MODEL=${EMBEDDING_MODEL:-qwen3-embedding:0.6b}
+      - EMBEDDING_BINDING_HOST=http://ollama:11434
+      - EMBEDDING_DIM=${EMBEDDING_DIM:-1024}
+      # Neo4j
+      - NEO4J_URI=bolt://neo4j:7687
+      - NEO4J_USERNAME=neo4j
+      - NEO4J_PASSWORD=password
+      # MongoDB
+      - MONGO_URI=mongodb://${MONGO_ROOT_USERNAME:-admin}:${MONGO_ROOT_PASSWORD:-password}@mongodb:27017
+      - MONGO_DB_NAME=${MONGO_DATABASE:-lightrag}
+      - MONGO_PASSWORD=${MONGO_ROOT_PASSWORD:-password}
+      # Storage
+      - LIGHTRAG_GRAPH_STORAGE=Neo4JStorage
+      - KV_STORAGE=JsonKVStorage
+      - VECTOR_STORAGE=NanoVectorDBStorage
+    volumes:
+      - ./rag_storage:/app/rag_storage
+    # depends_on:
+    #   neo4j:
+    #     condition: service_healthy
+      # vllm:
+      #   condition: service_healthy
+      # ollama:
+      #   condition: service_healthy
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 30s
+  
+  # =============================================================================
+  # Pipeline Service
+  # =============================================================================
+  pipeline:
+    build:
+      context: .
+      dockerfile: Dockerfile.app
+    container_name: lightrag-pipeline
+    ports:
+      - "${PIPELINE_PORT:-8003}:8003"
+    environment:
+      - PIPELINE_HOST=0.0.0.0
+      - PIPELINE_PORT=8003
+      - LIGHTRAG_HOST=lightrag
+      - LIGHTRAG_PORT=8000
+      - LIGHTRAG_WORKING_DIR=/app/rag_storage
+      # vLLM Configuration
+      - VLLM_BASE_URL=http://vllm:8000/v1
+      - VLLM_API_KEY=EMPTY
+      - VLLM_MODEL=${VLLM_MODEL:-LiquidAI/LFM2-2.6B}
+      # Embedding (Ollama)
+      - EMBEDDING_MODEL=${EMBEDDING_MODEL:-qwen3-embedding:0.6b}
+      - EMBEDDING_BINDING_HOST=http://ollama:11434
+      - EMBEDDING_DIM=${EMBEDDING_DIM:-1024}
+      # ColBERT Service
+      - COLBERT_SERVICE_URL=http://colbert:8002
+    command: ["python", "-m", "uvicorn", "pipeline:app", "--host", "0.0.0.0", "--port", "8003"]
+    volumes:
+      - ./rag_storage:/app/rag_storage
+    # depends_on:
+    #   lightrag:
+    #     condition: service_healthy
+      # vllm:
+      #   condition: service_healthy
+      # ollama:
+      #   condition: service_healthy
+      # colbert:
+      #   condition: service_healthy
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8003/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 30s
+  
+  frontend:
+    build:
+      context: .
+      dockerfile: Dockerfile.frontend
+    container_name: lightrag-frontend
+    ports:
+      - "${FRONTEND_PORT:-3000}:80"
+    environment:
+      - BACKEND_HOST=${BACKEND_HOST:-app}
+      - BACKEND_PORT=${BACKEND_PORT:-8000}
+    # depends_on:
+    #   app:
+    #     condition: service_healthy
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:80"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 10s
   # =============================================================================
   # Main Application (Multi-Agent LightRAG API)
   # =============================================================================
-  # app:
-  #   build:
-  #     context: .
-  #     dockerfile: Dockerfile.app
-  #   container_name: multiagent-lightrag-api
-  #   ports:
-  #     - "10000:10000"
-  #   environment:
-  #     # LightRAG Configuration
-  #     - LIGHTRAG_WORKING_DIR=/app/rag_storage
-  #     - LIGHTRAG_GRAPH_STORAGE=Neo4JStorage
-  #     - LIGHTRAG_KV_STORAGE=JsonKVStorage
-  #     - LIGHTRAG_VECTOR_STORAGE=NanoVectorDBStorage
-  #     # Neo4j
-  #     - NEO4J_URI=bolt://neo4j:7687
-  #     - NEO4J_USERNAME=neo4j
-  #     - NEO4J_PASSWORD=password
-  #     # Redis
-  #     - REDIS_URL=redis://redis:6379
-  #     # LLM Configuration (vLLM)
-  #     - VLLM_BASE_URL=http://vllm:8000/v1
-  #     - VLLM_API_KEY=EMPTY
-  #     - VLLM_MODEL=${VLLM_MODEL:-LiquidAI/LFM2-2.6B}
-  #     - LLM_BINDING_HOST=http://vllm:8000/v1
-  #     - LLM_BINDING_API_KEY=EMPTY
-  #     - LLM_MODEL=${VLLM_MODEL:-LiquidAI/LFM2-2.6B}
-  #     # Embedding (Ollama)
-  #     - EMBEDDING_MODEL=${EMBEDDING_MODEL:-nomic-embed-text:latest}
-  #     - EMBEDDING_BINDING_HOST=http://ollama:11434
-  #     - EMBEDDING_DIM=${EMBEDDING_DIM:-768}
-  #     # ColBERT Service
-  #     - COLBERT_SERVICE_URL=http://colbert:8002
-  #     # Multi-agent settings
-  #     - MAX_STEPS=${MAX_STEPS:-5}
-  #     - SIMILARITY_THRESHOLD=${SIMILARITY_THRESHOLD:-0.75}
-  #     - TOP_K=${TOP_K:-10}
-  #   volumes:
-  #     - ./rag_storage:/app/rag_storage
-  #   depends_on:
-  #     neo4j:
-  #       condition: service_healthy
-  #     redis:
-  #       condition: service_healthy
-  #     ollama:
-  #       condition: service_healthy
-  #   restart: unless-stopped
-  #   healthcheck:
-  #     test: ["CMD", "curl", "-f", "http://localhost:10000/health"]
-  #     interval: 30s
-  #     timeout: 10s
-  #     retries: 3
-  #     start_period: 30s
+  app:
+    build:
+      context: .
+      dockerfile: Dockerfile.app
+    container_name: multiagent-lightrag-api
+    ports:
+      - "${PORT:-8000}:8000"      
+    environment:
+      # LightRAG Configuration
+      - LIGHTRAG_WORKING_DIR=/app/rag_storage
+      - LIGHTRAG_GRAPH_STORAGE=Neo4JStorage
+      - LIGHTRAG_KV_STORAGE=JsonKVStorage
+      - LIGHTRAG_VECTOR_STORAGE=NanoVectorDBStorage
+      - LIGHTRAG_HOST=lightrag
+      - LIGHTRAG_PORT=${LIGHTRAG_PORT:-8005}
+      # Neo4j
+      - NEO4J_URI=bolt://neo4j:7687
+      - NEO4J_USERNAME=neo4j
+      - NEO4J_PASSWORD=password
+      # LLM Configuration (vLLM)
+      - VLLM_BASE_URL=http://vllm:/v1
+      - VLLM_API_KEY=EMPTY
+      - VLLM_MODEL=${VLLM_MODEL:-LiquidAI/LFM2-2.6B}
+      - LLM_BINDING_HOST=http://vllm:8000/v1
+      - LLM_BINDING_API_KEY=EMPTY
+      - LLM_MODEL=${VLLM_MODEL:-LiquidAI/LFM2-2.6B}
+      # Embedding (Ollama)
+      - EMBEDDING_MODEL=${EMBEDDING_MODEL:-nomic-embed-text:latest}
+      - EMBEDDING_BINDING_HOST=http://ollama:11434
+      - EMBEDDING_DIM=${EMBEDDING_DIM:-768}
+      # ColBERT Service
+      - COLBERT_SERVICE_URL=http://colbert:8002
+      # Multi-agent settings
+      - MAX_STEPS=${MAX_STEPS:-5}
+      - SIMILARITY_THRESHOLD=${SIMILARITY_THRESHOLD:-0.75}
+      - TOP_K=${TOP_K:-10}
+      - PIPELINE_HOST=pipeline
+      - PIPELINE_PORT=${PIPELINE_PORT:-8003} # Expose pipeline port for direct access if needed
+      - PORT=${PORT:-8000}
+    volumes:
+      - ./rag_storage:/app/rag_storage
+    # depends_on:
+    #   neo4j:
+    #     condition: service_healthy
+      # vllm:
+      #   condition: service_healthy
+      # ollama:
+      #   condition: service_healthy
+      # pipeline:
+      #   condition: service_healthy
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 30s
 
   # # =============================================================================
   # # Frontend
@@ -190,5 +349,7 @@ services:
 volumes:
   neo4j_data:
   neo4j_logs:
-  redis_data:
+  mongodb_data:
+  mongodb_config:
   ollama_data:
+  postgres_data:

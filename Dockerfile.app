@@ -1,7 +1,7 @@
 # Multi-Agent LightRAG API Dockerfile
 FROM python:3.12-slim
 
-WORKDIR /app
+WORKDIR /app    
 
 # Install system dependencies
 RUN apt-get update && apt-get install -y --no-install-recommends \
@@ -16,6 +16,8 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 
 # Copy requirements first for better caching
 COPY requirements.txt .
+
+RUN pip install --no-cache-dir "pip<24.1"
 
 # Install Python dependencies
 RUN pip install --no-cache-dir -r requirements.txt
@@ -34,12 +36,12 @@ COPY *.py /app/
 RUN mkdir -p /app/rag_storage
 
 # Expose port
-EXPOSE 10000
+EXPOSE 8000
 
 # Environment variables
 ENV PYTHONUNBUFFERED=1
 ENV HOST=0.0.0.0
-ENV PORT=10000
+ENV PORT=8000
 
 # Run the application
-CMD ["python", "-m", "uvicorn", "app:app", "--host", "0.0.0.0", "--port", "10000"]
+CMD ["python", "-m", "uvicorn", "app:app", "--host", "0.0.0.0", "--port", "8000"]

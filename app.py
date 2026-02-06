@@ -11,7 +11,9 @@ import os
 import sys
 import traceback
 import logging
+import uuid
 from contextlib import asynccontextmanager
+from datetime import datetime
 from typing import Any
 
 import httpx
@@ -19,6 +21,7 @@ from fastapi import FastAPI, HTTPException, UploadFile, File, Form, Request
 from fastapi.responses import StreamingResponse, JSONResponse
 from fastapi.exceptions import RequestValidationError
 from pydantic import BaseModel, Field
+from psycopg2.pool import SimpleConnectionPool
 
 # Add light_rag to the path for imports
 sys.path.insert(0, './light_rag')
@@ -41,9 +44,20 @@ MAX_STEPS = int(os.getenv("MAX_STEPS", "5"))
 SIMILARITY_THRESHOLD = float(os.getenv("SIMILARITY_THRESHOLD", "0.75"))
 TOP_K = int(os.getenv("TOP_K", "10"))
 
+# Postgres configuration
+POSTGRES_HOST = os.getenv("POSTGRES_HOST", "localhost")
+POSTGRES_PORT = int(os.getenv("POSTGRES_PORT", "5432"))
+POSTGRES_DB = os.getenv("POSTGRES_DB", "postgres")
+POSTGRES_USER = os.getenv("POSTGRES_USER", "postgres")
+POSTGRES_PASSWORD = os.getenv("POSTGRES_PASSWORD", "postgres")
+POSTGRES_SSLMODE = os.getenv("POSTGRES_SSLMODE", "prefer")
+POSTGRES_POOL_MIN = int(os.getenv("POSTGRES_POOL_MIN", "1"))
+POSTGRES_POOL_MAX = int(os.getenv("POSTGRES_POOL_MAX", "5"))
+
 # Global instances
 http_client: httpx.AsyncClient | None = None
 http_sync_client: httpx.Client | None = None
+db_pool: SimpleConnectionPool | None = None
 
 # Configure logging
 logging.basicConfig(
@@ -72,6 +86,27 @@ class IngestResponse(BaseModel):
     message: str
     track_id: str | None = None
     doc_id: str | None = None
+
+
+class DocumentStatusRecord(BaseModel):
+    """Document status as stored in Postgres."""
+
+    document_id: str
+    document_status: str
+    file_path: str | None = None
+    updated_at: datetime
+
+
+class DocumentStatusRequest(BaseModel):
+    """Request model for fetching document statuses."""
+
+    document_ids: list[str]
+
+
+class DocumentStatusResponse(BaseModel):
+    """Response model containing document statuses."""
+
+    documents: list[DocumentStatusRecord]
 
 
 class QueryRequest(BaseModel):
@@ -108,7 +143,7 @@ class HealthResponse(BaseModel):
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Manage application lifespan - initialize and cleanup resources."""
-    global http_client, http_sync_client
+    global http_client, http_sync_client, db_pool
 
     # Startup
     print("Initializing app...")
@@ -119,6 +154,9 @@ async def lifespan(app: FastAPI):
     print(f"LightRAG service URL: {LIGHTRAG_SERVICE_URL}")
     print(f"Pipeline service URL: {PIPELINE_SERVICE_URL}")
 
+    # Initialize Postgres connection pool for document status tracking
+    db_pool = init_db_pool()
+
     yield
 
     # Shutdown
@@ -127,6 +165,8 @@ async def lifespan(app: FastAPI):
         await http_client.aclose()
     if http_sync_client:
         http_sync_client.close()
+    if db_pool:
+        db_pool.closeall()
     print("Cleanup complete.")
 
 
@@ -222,6 +262,137 @@ async def validation_exception_handler(request: Request, exc: RequestValidationE
 # ============================================================================
 # Helper Functions
 # ============================================================================
+
+
+def init_db_pool() -> SimpleConnectionPool | None:
+    """Initialize Postgres connection pool and ensure documents table exists."""
+    try:
+        pool = SimpleConnectionPool(
+            POSTGRES_POOL_MIN,
+            POSTGRES_POOL_MAX,
+            dbname=POSTGRES_DB,
+            user=POSTGRES_USER,
+            password=POSTGRES_PASSWORD,
+            host=POSTGRES_HOST,
+            port=POSTGRES_PORT,
+            sslmode=POSTGRES_SSLMODE,
+        )
+        ensure_documents_table(pool)
+        logger.info("Initialized Postgres pool for document tracking")
+        return pool
+    except Exception:
+        logger.exception("Failed to initialize Postgres pool; document tracking disabled")
+        return None
+
+
+def ensure_documents_table(pool: SimpleConnectionPool) -> None:
+    """Create Documents table if it does not already exist."""
+    if not pool:
+        return
+
+    conn = pool.getconn()
+    try:
+        with conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    CREATE TABLE IF NOT EXISTS documents (
+                        document_id UUID PRIMARY KEY,
+                        document_status TEXT NOT NULL,
+                        file_path TEXT,
+                        created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                        updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+                    );
+                    """
+                )
+    except Exception:
+        logger.exception("Failed to ensure documents table")
+    finally:
+        pool.putconn(conn)
+
+
+def record_document_status(
+    document_id: str,
+    status: str,
+    file_path: str | None = None,
+) -> None:
+    """Insert or update document status in the Documents table."""
+    if not db_pool:
+        logger.warning("Postgres pool not available; skipping document status record")
+        return
+
+    conn = db_pool.getconn()
+    try:
+        with conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    INSERT INTO documents (document_id, document_status, file_path)
+                    VALUES (%s, %s, %s)
+                    ON CONFLICT (document_id) DO UPDATE SET
+                        document_status = EXCLUDED.document_status,
+                        file_path = COALESCE(EXCLUDED.file_path, documents.file_path),
+                        updated_at = NOW();
+                    """,
+                    (document_id, status, file_path),
+                )
+                logger.info(
+                    "Document status upsert succeeded: id=%s status=%s file_path=%s (%s)",
+                    document_id,
+                    status,
+                    file_path,
+                    cur.statusmessage,
+                )
+    except Exception:
+        logger.exception("Failed to upsert document status for %s", document_id)
+    finally:
+        db_pool.putconn(conn)
+
+
+def fetch_document_statuses(document_ids: list[str]) -> list[DocumentStatusRecord]:
+    """Fetch statuses for the given document IDs from Postgres."""
+    if not db_pool:
+        raise HTTPException(status_code=503, detail="Database connection not initialized")
+
+    if not document_ids:
+        return []
+
+    try:
+        # Use strings to avoid psycopg2 UUID adaptation issues when passing arrays
+        uuid_ids = [str(uuid.UUID(doc_id)) for doc_id in document_ids]
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail="Invalid document_id format") from exc
+
+    conn = db_pool.getconn()
+    try:
+        with conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    SELECT document_id::text, document_status, file_path, updated_at
+                    FROM documents
+                    WHERE document_id = ANY(%s::uuid[]);
+                    """,
+                    (uuid_ids,),
+                )
+                rows = cur.fetchall()
+
+        return [
+            DocumentStatusRecord(
+                document_id=row[0],
+                document_status=row[1],
+                file_path=row[2],
+                updated_at=row[3],
+            )
+            for row in rows
+        ]
+    except HTTPException:
+        raise
+    except Exception:
+        logger.exception("Failed to fetch document statuses")
+        raise HTTPException(status_code=500, detail="Failed to fetch document statuses")
+    finally:
+        db_pool.putconn(conn)
 
 async def check_lightrag_service_health() -> bool:
     """Check if the LightRAG service is healthy."""
@@ -404,6 +575,9 @@ async def ingest_document(request: IngestRequest):
     if not http_sync_client:
         raise HTTPException(status_code=503, detail="HTTP client not initialized")
 
+    document_id = request.doc_id or str(uuid.uuid4())
+    record_document_status(document_id, "uploaded", request.file_path)
+
     try:
         # Prepare request body for LightRAG service
         ingest_request = {
@@ -425,7 +599,7 @@ async def ingest_document(request: IngestRequest):
             status=result.get("status", "success"),
             message=result.get("message", "Document ingested successfully"),
             track_id=result.get("track_id"),
-            doc_id=request.doc_id,
+            doc_id=document_id,
         )
 
     except httpx.ConnectError:
@@ -461,6 +635,9 @@ async def ingest_file(
     if not http_sync_client:
         raise HTTPException(status_code=503, detail="HTTP client not initialized")
 
+    document_id = doc_id or str(uuid.uuid4())
+    record_document_status(document_id, "uploaded", file.filename)
+
     try:
         import tempfile
         import fitz  # PyMuPDF
@@ -490,6 +667,7 @@ async def ingest_file(
             # Prepare request body for LightRAG service
             ingest_request = {
                 "text": text_content,
+                "document_id": document_id,
             }
             if file.filename:
                 ingest_request["file_path"] = file.filename
@@ -507,7 +685,7 @@ async def ingest_file(
                 status=result.get("status", "success"),
                 message=f"File '{file.filename}' ingested successfully",
                 track_id=result.get("track_id"),
-                doc_id=doc_id,
+                doc_id=document_id,
             )
         finally:
             # Clean up temporary file
@@ -646,24 +824,36 @@ async def get_ingestion_status(track_id: str):
     """
     Get the status of a document ingestion job.
     """
-    if not http_sync_client:
+    if not http_client:
         raise HTTPException(status_code=503, detail="HTTP client not initialized")
 
     try:
-        # Note: This endpoint may need to be implemented in the LightRAG service
-        # For now, we return a placeholder response
+        response = await http_client.get(
+            f"{LIGHTRAG_SERVICE_URL}/document/status/{track_id}"
+        )
+        response.raise_for_status()
+        status = response.text.strip('"')
         return {
             "track_id": track_id,
-            "status": "processing",
-            "message": "Status tracking will be implemented via LightRAG service"
+            "status": status,
         }
+    except httpx.ConnectError:
+        raise HTTPException(
+            status_code=503,
+            detail=f"Cannot connect to LightRAG service at {LIGHTRAG_SERVICE_URL}"
+        )
+    except httpx.HTTPStatusError as e:
+        raise HTTPException(status_code=e.response.status_code, detail=str(e))
     except Exception as e:
         logger.error(f"Failed to get status: {str(e)}\n{traceback.format_exc()}", exc_info=True)
-        print(f"\n{'='*80}")
-        print(f"Status Error: {str(e)}")
-        traceback.print_exc()
-        print(f"{'='*80}\n")
         raise HTTPException(status_code=500, detail=f"Failed to get status: {str(e)}")
+
+
+@app.post("/documents/status", response_model=DocumentStatusResponse)
+async def get_document_statuses(request: DocumentStatusRequest):
+    """Return the current statuses for the requested document IDs."""
+    documents = fetch_document_statuses(request.document_ids)
+    return DocumentStatusResponse(documents=documents)
 
 
 # ============================================================================
